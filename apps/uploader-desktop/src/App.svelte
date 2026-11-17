@@ -127,100 +127,113 @@
   }
 </script>
 
-<main class="container">
+<main class="mx-auto max-w-2xl px-6 py-10">
+  <header class="mb-8 flex items-center gap-3">
+    <div class="grid h-10 w-10 place-items-center rounded-xl bg-gradient-to-br from-indigo-500 to-emerald-500 text-lg font-bold text-white">S</div>
+    <div>
+      <h1 class="text-xl font-bold leading-tight">SiaShare</h1>
+      <p class="muted">Отправка файлов в Sia Storage</p>
+    </div>
+    {#if isConnected}
+      <span class="ml-auto inline-flex items-center gap-2 rounded-full border border-emerald-500/30 bg-emerald-500/10 px-3 py-1 text-xs font-medium text-emerald-300">
+        <span class="h-1.5 w-1.5 rounded-full bg-emerald-400"></span>Подключено
+      </span>
+    {/if}
+  </header>
+
   {#if !isConnected}
     <div class="card">
-      <h2>Подключение к Sia Storage</h2>
+      <h2 class="mb-4 text-lg font-semibold">Подключение к Sia Storage</h2>
       {#if authWaiting}
-        <p>Подтвердите подключение в открывшемся браузере…</p>
+        <p class="animate-pulse text-sm text-slate-300">Подтвердите подключение в открывшемся браузере…</p>
         {#if authUrl}
-          <p class="muted">Если браузер не открылся, скопируйте ссылку:</p>
-          <code class="phrase">{authUrl}</code>
-          <button on:click={() => copyText(authUrl)}>Скопировать ссылку</button>
+          <p class="muted mt-3">Если браузер не открылся, скопируйте ссылку:</p>
+          <code class="phrase my-3">{authUrl}</code>
+          <button class="btn-secondary" on:click={() => copyText(authUrl)}>Скопировать ссылку</button>
         {/if}
       {:else}
-        <button on:click={() => connect(true)}>Создать новый аккаунт</button>
-        <p class="muted">или войдите существующей 12-словной фразой:</p>
-        <textarea bind:value={seedPhrase} rows="3" placeholder="word1 word2 … word12" />
-        <button on:click={() => connect(false)} disabled={!seedPhrase.trim()}>Войти по фразе</button>
+        <div class="flex flex-col gap-4">
+          <button class="btn-primary" on:click={() => connect(true)}>Создать новый аккаунт</button>
+          <div>
+            <p class="muted mb-2">или войдите существующей 12-словной фразой:</p>
+            <textarea class="input mb-3" bind:value={seedPhrase} rows="3" placeholder="word1 word2 … word12" />
+            <button class="btn-secondary w-full" on:click={() => connect(false)} disabled={!seedPhrase.trim()}>Войти по фразе</button>
+          </div>
+        </div>
       {/if}
-      {#if authError}<p class="warn">{authError}</p>{/if}
+      {#if authError}<p class="mt-4 text-sm text-red-400">{authError}</p>{/if}
     </div>
   {:else}
     {#if backupPhrase}
-      <div class="card warn-box">
-        <h3>Запишите фразу восстановления!</h3>
-        <p class="muted">Она показывается один раз и НЕ сохраняется на диске. Без нее не восстановить аккаунт.</p>
-        <code class="phrase">{backupPhrase}</code>
-        <button on:click={() => copyText(backupPhrase)}>Скопировать</button>
-        <button on:click={() => (backupPhrase = '')}>Я сохранил фразу</button>
+      <div class="card mb-6 border-amber-500/40 bg-amber-500/10">
+        <h3 class="mb-2 text-lg font-semibold text-amber-300">Запишите фразу восстановления!</h3>
+        <p class="muted mb-3">Она показывается один раз и НЕ сохраняется на диске. Без нее не восстановить аккаунт.</p>
+        <code class="phrase mb-4">{backupPhrase}</code>
+        <div class="flex gap-3">
+          <button class="btn-primary" on:click={() => copyText(backupPhrase)}>Скопировать</button>
+          <button class="btn-secondary" on:click={() => (backupPhrase = '')}>Я сохранил фразу</button>
+        </div>
       </div>
     {/if}
 
-    <h2>Отправка файлов в Sia Storage</h2>
-    <div class="form-group">
-      <label>Название раздачи:<input type="text" bind:value={sessionName} /></label>
-      <label>Срок жизни ссылки (дней):<input type="number" min="1" bind:value={validDays} /></label>
-      <label>Пароль на скачивание (необязательно):<input type="password" bind:value={password} /></label>
+    <div class="card mb-6">
+      <h2 class="mb-4 text-lg font-semibold">Параметры раздачи</h2>
+      <div class="grid gap-4">
+        <label class="block">
+          <span class="mb-1.5 block text-sm font-medium text-slate-300">Название раздачи</span>
+          <input class="input" type="text" bind:value={sessionName} />
+        </label>
+        <div class="grid grid-cols-2 gap-4">
+          <label class="block">
+            <span class="mb-1.5 block text-sm font-medium text-slate-300">Срок жизни ссылки (дней)</span>
+            <input class="input" type="number" min="1" bind:value={validDays} />
+          </label>
+          <label class="block">
+            <span class="mb-1.5 block text-sm font-medium text-slate-300">Пароль на скачивание</span>
+            <input class="input" type="password" bind:value={password} placeholder="необязательно" />
+          </label>
+        </div>
+      </div>
     </div>
-    <div class="actions">
-      <button on:click={() => selectAndUpload(false)}>Выбрать файлы</button>
-      <button on:click={() => selectAndUpload(true)}>Выбрать папку целиком</button>
+
+    <div class="mb-6 flex gap-3">
+      <button class="btn-primary" on:click={() => selectAndUpload(false)}>Выбрать файлы</button>
+      <button class="btn-secondary" on:click={() => selectAndUpload(true)}>Выбрать папку целиком</button>
     </div>
 
     {#if activeSessionId && !completedKeyBytes && !uploadError}
-      <div class="status-box">
-        <div class="progress-bar">
-          <div class="fill" style="width:{percent}%"></div>
-          <span>{percent}%</span>
+      <div class="card mb-6">
+        <div class="relative mb-3 h-6 overflow-hidden rounded-full bg-slate-800">
+          <div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-[width] duration-200" style="width:{percent}%"></div>
+          <span class="absolute inset-0 grid place-items-center text-xs font-semibold text-white">{percent}%</span>
         </div>
-        <p>Закреплено чанков: <strong>{uploadedChunks}</strong> из {totalChunks}
-          {#if failedChunks > 0}<span class="warn">(ошибок: {failedChunks})</span>{/if}
+        <p class="text-sm text-slate-300">Закреплено чанков: <strong class="text-white">{uploadedChunks}</strong> из {totalChunks}
+          {#if failedChunks > 0}<span class="text-amber-400">(ошибок: {failedChunks})</span>{/if}
         </p>
-        {#if lastChunkError}<p class="muted">Последняя ошибка (будет повтор): {lastChunkError}</p>{/if}
-        <small>Вы можете закрыть программу — при следующем запуске загрузка продолжится с незавершенных чанков.</small>
+        {#if lastChunkError}<p class="muted mt-2">Последняя ошибка (будет повтор): {lastChunkError}</p>{/if}
+        <p class="muted mt-3 text-xs">Вы можете закрыть программу — при следующем запуске загрузка продолжится с незавершенных чанков.</p>
       </div>
     {/if}
 
     {#if uploadError}
-      <div class="status-box warn-box">
-        <h3>Раздача не удалась</h3>
-        <p class="warn">{uploadError}</p>
+      <div class="card mb-6 border-red-500/40 bg-red-500/10">
+        <h3 class="mb-2 text-lg font-semibold text-red-300">Раздача не удалась</h3>
+        <p class="text-sm text-red-300/90">{uploadError}</p>
       </div>
     {/if}
 
     {#if completedKeyBytes}
-      <div class="status-box success">
-        <h3>Загрузка завершена!</h3>
+      <div class="card border-emerald-500/40 bg-emerald-500/10">
+        <h3 class="mb-4 text-lg font-semibold text-emerald-300">Загрузка завершена!</h3>
         {#if revoked}
-          <p class="warn">Доступ отозван — получатель больше не сможет скачать файлы.</p>
+          <p class="text-sm text-amber-300">Доступ отозван — получатель больше не сможет скачать файлы.</p>
         {:else}
-          <button on:click={exportShareZip}>Сохранить Sia.zip для отправки</button>
-          <button class="danger" on:click={revokeAccess}>Отозвать доступ</button>
+          <div class="flex flex-wrap gap-3">
+            <button class="btn-primary" on:click={exportShareZip}>Сохранить Sia.zip для отправки</button>
+            <button class="btn-danger" on:click={revokeAccess}>Отозвать доступ</button>
+          </div>
         {/if}
       </div>
     {/if}
   {/if}
 </main>
-
-<style>
-  .container { font-family: system-ui, sans-serif; padding: 24px; max-width: 720px; margin: 0 auto; }
-  .form-group { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
-  .form-group label { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
-  input, textarea { padding: 8px; border: 1px solid #ccc; border-radius: 6px; }
-  textarea { width: 100%; margin-bottom: 12px; box-sizing: border-box; }
-  .actions { display: flex; gap: 12px; margin-bottom: 20px; }
-  button { padding: 10px 16px; background: #2563eb; color: white; border: none; border-radius: 6px; cursor: pointer; margin-right: 8px; }
-  button:disabled { opacity: 0.5; cursor: not-allowed; }
-  button.danger { background: #dc2626; }
-  .card { border: 1px solid #ddd; padding: 24px; border-radius: 8px; margin-bottom: 16px; }
-  .status-box { padding: 16px; border-radius: 8px; background: #f3f4f6; border: 1px solid #ddd; margin-bottom: 16px; }
-  .status-box.success { background: #ecfdf5; border-color: #10b981; }
-  .warn-box { background: #fef2f2; border-color: #dc2626; }
-  .warn { color: #dc2626; }
-  .muted { color: #666; font-size: 0.9em; }
-  .phrase { display: block; background: #f9fafb; border: 1px solid #ddd; padding: 10px; border-radius: 6px; margin: 10px 0; word-break: break-all; user-select: all; }
-  .progress-bar { background: #eee; border-radius: 6px; height: 24px; position: relative; overflow: hidden; margin-bottom: 10px; }
-  .progress-bar .fill { background: #10b981; height: 100%; transition: width 0.2s; }
-  .progress-bar span { position: absolute; inset: 0; text-align: center; line-height: 24px; font-size: 0.85em; }
-</style>

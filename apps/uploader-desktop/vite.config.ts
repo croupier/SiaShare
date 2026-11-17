@@ -1,11 +1,12 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import tailwindcss from "@tailwindcss/vite";
 
 // TAURI_DEV_HOST задается при отладке на мобильном устройстве
 const host = process.env.TAURI_DEV_HOST;
 
 export default defineConfig({
-  plugins: [svelte()],
+  plugins: [tailwindcss(), svelte()],
   // Tauri сам рисует окно: не очищаем его вывод в терминале
   clearScreen: false,
   server: {

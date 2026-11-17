@@ -194,8 +194,8 @@ Fallback — `key.sia` рядом с бинарником (подъём до 4 �
 
 ```powershell
 # Порядок важен: generate_context! вшивает frontendDist на этапе КОМПИЛЯЦИИ
-cd apps\receiver-micro;   npm install; npm run build; cd ..\..
 cd apps\uploader-desktop; npm install; npm run build; cd ..\..
+cd apps\receiver-micro;   npm install; npm run build; cd ..\..
 cargo test --workspace
 
 # Шаблон получателя нужен отправителю в resources/ ДО его запуска
