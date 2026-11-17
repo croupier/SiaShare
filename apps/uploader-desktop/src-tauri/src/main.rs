@@ -9,7 +9,41 @@ use commands::{
     revoke_session, start_upload_session, UploaderState,
 };
 use db::Database;
-use tauri::Manager;
+use std::path::PathBuf;
+use tauri::{AppHandle, Manager};
+
+/// Очередь живет в storage/ в корне проекта (видна и редактируема при разработке),
+/// корень ищется вверх от пути exe по маркерам workspace. У установленной сборки
+/// маркеров нет — тогда каталог данных приложения.
+fn queue_db_path(app: &AppHandle) -> PathBuf {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(root) = project_root(&exe) {
+            return root.join("storage").join("queue.db");
+        }
+    }
+    app.path().app_data_dir().expect("каталог данных приложения").join("queue.db")
+}
+
+fn project_root(exe: &std::path::Path) -> Option<&std::path::Path> {
+    exe.ancestors()
+        .find(|d| d.join("Cargo.toml").is_file() && d.join("crates").is_dir())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_project_root_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(dir.path().join("crates")).unwrap();
+        let exe = dir.path().join("target").join("debug").join("app.exe");
+        assert_eq!(super::project_root(&exe), Some(dir.path()));
+        // установленная сборка вне workspace — корня нет
+        let outside = tempfile::tempdir().unwrap();
+        let exe2 = outside.path().join("app.exe");
+        assert_eq!(super::project_root(&exe2), None);
+    }
+}
 
 fn main() {
     tauri::Builder::default()
@@ -23,9 +57,11 @@ fn main() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            let app_data_dir = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&app_data_dir)?;
-            let db = Database::init(&app_data_dir.join("queue.db")).expect("SQLite");
+            let db_path = queue_db_path(app.handle());
+            if let Some(parent) = db_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let db = Database::init(&db_path).expect("SQLite");
             // Воркеры стартуют один раз и живут всю жизнь приложения;
             // подключение они получают через watch-канал (изначально None)
             let sdk_tx = worker::start_upload_workers(app.handle().clone(), db.clone(), 3);
