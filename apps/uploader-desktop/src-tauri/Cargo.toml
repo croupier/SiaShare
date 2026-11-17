@@ -1,0 +1,28 @@
+[package]
+name = "uploader-desktop"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+sia-core = { path = "../../../crates/sia-core" }
+sia_storage = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+rusqlite = { workspace = true }
+uuid = { workspace = true }
+zip = { workspace = true }
+chrono = { workspace = true }
+hex = { workspace = true }
+walkdir = { workspace = true }
+keyring = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
+
+[dev-dependencies]
+tempfile = { workspace = true }

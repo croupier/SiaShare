@@ -1,0 +1,231 @@
+use crate::db::Database;
+use sia_core::crypto::build_receiver_filename;
+use sia_core::sia_client::{begin_connection, connect_with_app_key, ensure_capacity, finish_connection, revoke_share};
+use sia_storage::Sdk;
+use std::collections::HashSet;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::path::Path;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, Manager, State};
+use tauri_plugin_opener::OpenerExt;
+use tokio::sync::watch;
+use walkdir::WalkDir;
+use zip::write::SimpleFileOptions;
+use zip::ZipWriter;
+
+const KEYRING_SERVICE: &str = "siashare-desktop";
+const KEYRING_USER: &str = "sia-app-key";
+
+pub struct UploaderState {
+    pub db: Database,
+    /// ЕДИНЫЙ источник правды о подключении: и команды, и воркеры читают
+    /// этот watch-канал. Отдельного Mutex<Option<Arc<Sdk>>> нет — двойное
+    /// состояние давало гонку при повторном входе.
+    pub sdk_tx: watch::Sender<Option<Arc<Sdk>>>,
+}
+
+/// Клонирует текущий SDK из канала без блокировок: subscribe() отдает
+/// receiver с актуальным значением, borrow().clone() — сам Option<Arc<Sdk>>.
+fn current_sdk(state: &State<'_, UploaderState>) -> Result<Arc<Sdk>, String> {
+    state.sdk_tx.subscribe().borrow().clone().ok_or_else(|| "Сначала выполните вход в Sia Storage".into())
+}
+
+fn keyring_entry() -> Result<keyring::Entry, String> {
+    keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER).map_err(|e| e.to_string())
+}
+
+/// 1. Автовход по ключу из СИСТЕМНОГО keychain (не plaintext-файл!).
+#[tauri::command]
+pub async fn check_saved_auth(state: State<'_, UploaderState>) -> Result<bool, String> {
+    let hex_key = match keyring_entry()?.get_password() {
+        Ok(k) => k,
+        Err(_) => return Ok(false), // ключа нет — покажем экран входа
+    };
+    let bytes = hex::decode(&hex_key).map_err(|e| e.to_string())?;
+    match connect_with_app_key(&bytes).await {
+        Ok(Some(sdk)) => { activate_sdk(&state, sdk); Ok(true) }
+        // None = ключ отозван/недействителен — нужен повторный approval
+        _ => Ok(false),
+    }
+}
+
+/// 2. Первичный вход: approval на странице индексатора + регистрация фразы.
+/// seed_phrase = None -> новый аккаунт (фраза придёт событием auth-phrase);
+/// Some -> вход существующей фразой.
+#[tauri::command]
+pub async fn connect_sia(seed_phrase: Option<String>, app: AppHandle, state: State<'_, UploaderState>) -> Result<(), String> {
+    let builder = begin_connection().await.map_err(|e| e.to_string())?;
+    let url = builder.response_url().to_string();
+    // Открываем системный браузер и дублируем ссылку в UI (вдруг браузер не открылся)
+    let _ = app.opener().open_url(&url, None::<&str>);
+    let _ = app.emit("auth-url", &url);
+
+    // Ожидание может занять минуты — invoke висит, UI живет на событиях
+    let (sdk, generated, app_key) = finish_connection(builder, seed_phrase).await.map_err(|e| e.to_string())?;
+    if let Some(phrase) = generated {
+        // Показываем один раз для записи; в БД/файлы фразу НЕ пишем
+        let _ = app.emit("auth-phrase", phrase);
+    }
+    keyring_entry()?.set_password(&hex::encode(app_key)).map_err(|e| format!("Keychain: {e}"))?;
+    activate_sdk(&state, sdk);
+    Ok(())
+}
+
+/// Единственная точка обновления подключения: воркеры подхватят новый SDK
+/// на следующей итерации своего цикла.
+fn activate_sdk(state: &State<'_, UploaderState>, sdk: Sdk) {
+    let _ = state.sdk_tx.send(Some(Arc::new(sdk)));
+}
+
+/// 3. Рекурсивный обход + дедупликация путей + проверка квоты + очередь.
+#[tauri::command]
+pub async fn start_upload_session(
+    session_name: String,
+    paths: Vec<String>,
+    valid_days: i64,
+    state: State<'_, UploaderState>,
+) -> Result<String, String> {
+    if valid_days <= 0 { return Err("Срок жизни ссылки должен быть >= 1 дня".into()); }
+    let sdk = current_sdk(&state)?;
+
+    let mut collected = collect_files_recursive(&paths)?;
+    if collected.is_empty() { return Err("Не найдено ни одного файла".into()); }
+    dedupe_rel_paths(&mut collected);
+
+    // Квота: сумма логических размеров против remaining_storage индексатора
+    let planned: u64 = collected.iter().map(|(_, _, s)| *s).sum();
+    ensure_capacity(&sdk, planned).await.map_err(|e| e.to_string())?;
+
+    let expires_at = chrono::Utc::now().timestamp() + valid_days * 86400;
+    state.db.create_session(&session_name, &collected, expires_at).map_err(|e| format!("Ошибка БД: {e}"))
+}
+
+/// Одноименные файлы/папки в одной сессии склеились бы получателем в один
+/// файл — добавляем суффикс " (2)", " (3)"... перед расширением.
+fn dedupe_rel_paths(files: &mut [(String, String, u64)]) {
+    let mut seen: HashSet<String> = HashSet::new();
+    for (_, rel, _) in files.iter_mut() {
+        if seen.insert(rel.clone()) { continue; }
+        let p = Path::new(rel.as_str());
+        let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
+        let ext = p.extension().and_then(|s| s.to_str());
+        let parent = p.parent().filter(|x| x.as_os_str().len() > 0);
+        for i in 2.. {
+            let name = match ext { Some(e) => format!("{stem} ({i}).{e}"), None => format!("{stem} ({i})") };
+            let candidate = match parent { Some(dir) => format!("{}/{name}", dir.display()), None => name };
+            if seen.insert(candidate.clone()) { *rel = candidate; break; }
+        }
+    }
+}
+
+/// Обходит список путей (файлов или директорий) -> (local_path, rel_path, size).
+pub fn collect_files_recursive(input_paths: &[String]) -> Result<Vec<(String, String, u64)>, String> {
+    let mut result = Vec::new();
+    for raw_path in input_paths {
+        let root = Path::new(raw_path);
+        if !root.exists() { continue; }
+        if root.is_file() {
+            let meta = fs::metadata(root).map_err(|e| e.to_string())?;
+            let file_name = root.file_name().and_then(|n| n.to_str()).unwrap_or("file.bin").to_string();
+            result.push((raw_path.clone(), file_name, meta.len()));
+        } else if root.is_dir() {
+            // Берем родительскую директорию, чтобы имя выбранной папки вошло в rel_path
+            let base_parent = root.parent().unwrap_or(root);
+            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+                if entry.file_type().is_file() {
+                    let full_path = entry.path();
+                    let meta = entry.metadata().map_err(|e| e.to_string())?;
+                    // Нормализуем разделители путей в '/' для кроссплатформенности
+                    let rel_path = full_path.strip_prefix(base_parent).unwrap_or(full_path)
+                        .to_string_lossy().replace('\\', "/");
+                    result.push((full_path.to_string_lossy().to_string(), rel_path, meta.len()));
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+/// 4. Собирает Sia.zip: шаблон receiver-micro + имя S#r_/S#p1_<ключ>.exe.
+#[tauri::command]
+pub async fn generate_share_zip(
+    output_zip_path: String,
+    sharing_key_bytes: Vec<u8>,
+    password: Option<String>,
+    app: AppHandle,
+) -> Result<(), String> {
+    // Имя шаблона зафиксировано mainBinaryName в tauri.conf.json receiver'а
+    let template_name = if cfg!(target_os = "windows") { "resources/receiver-micro.exe" } else { "resources/receiver-micro" };
+    let template_path = app.path().resolve(template_name, tauri::path::BaseDirectory::Resource)
+        .map_err(|e| format!("Шаблон микро-клиента не найден: {e}"))?;
+    let ext = if cfg!(target_os = "windows") { "exe" } else { "" };
+    let inner_exe_name = build_receiver_filename(&sharing_key_bytes, password.as_deref(), ext).map_err(|e| e.to_string())?;
+
+    // Файловые операции — в блокирующем потоке, чтобы не тормозить async-рантайм
+    tokio::task::spawn_blocking(move || {
+        let mut template_file = File::open(&template_path)
+            .map_err(|e| format!("Не удалось открыть шаблон {template_path:?}: {e}"))?;
+        let mut exe_bytes = Vec::new();
+        template_file.read_to_end(&mut exe_bytes).map_err(|e| e.to_string())?;
+        let zip_file = File::create(&output_zip_path).map_err(|e| e.to_string())?;
+        let mut zip = ZipWriter::new(zip_file);
+        let options = SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o755); // исполняемый файл для Linux/macOS
+        zip.start_file(&inner_exe_name, options).map_err(|e| e.to_string())?;
+        zip.write_all(&exe_bytes).map_err(|e| e.to_string())?;
+        zip.finish().map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    }).await.map_err(|e| e.to_string())??;
+    Ok(())
+}
+
+/// 5. Досрочный отзыв раздачи. Токены скачивания доживают до ~5 минут.
+#[tauri::command]
+pub async fn revoke_session(session_id: String, state: State<'_, UploaderState>) -> Result<(), String> {
+    let sdk = current_sdk(&state)?;
+    let seed_hex = state.db.session_seed(&session_id).map_err(|e| e.to_string())?.ok_or("У сессии нет ключа")?;
+    let seed: [u8; 32] = hex::decode(&seed_hex).map_err(|e| e.to_string())?
+        .try_into().map_err(|_| "seed должен быть 32 байта")?;
+    revoke_share(&sdk, seed).await.map_err(|e| e.to_string())?;
+    state.db.mark_session_revoked(&session_id).map_err(|e| e.to_string())
+}
+
+/// Прогресс сессии для инициализации UI сразу после создания/перезапуска.
+#[tauri::command]
+pub async fn get_session_progress(session_id: String, state: State<'_, UploaderState>) -> Result<(i64, i64, i64), String> {
+    state.db.session_chunk_counts(&session_id).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_recursive_folder_scan() {
+        let dir = tempdir().unwrap();
+        let sub = dir.path().join("My Project").join("docs");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("readme.md"), b"hello").unwrap();
+        let target = dir.path().join("My Project").to_string_lossy().to_string();
+        let files = collect_files_recursive(&[target]).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].1, "My Project/docs/readme.md");
+        assert_eq!(files[0].2, 5);
+    }
+
+    #[test]
+    fn test_dedupe_rel_paths() {
+        let mut files = vec![
+            ("a".into(), "doc.txt".into(), 1),
+            ("b".into(), "doc.txt".into(), 2),
+            ("c".into(), "dir/doc.txt".into(), 3),
+            ("d".into(), "doc.txt".into(), 4),
+        ];
+        dedupe_rel_paths(&mut files);
+        let rels: Vec<_> = files.iter().map(|f| f.1.clone()).collect();
+        assert_eq!(rels, vec!["doc.txt", "doc (2).txt", "dir/doc.txt", "doc (3).txt"]);
+    }
+}

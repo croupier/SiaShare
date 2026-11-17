@@ -1,0 +1,21 @@
+/target
+**/node_modules
+**/dist
+**/.svelte-kit
+
+# Локально собранные шаблоны микро-клиента (в CI кладутся заново)
+apps/uploader-desktop/src-tauri/resources/receiver-micro
+apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
+
+# Локальная очередь загрузок
+*.db
+*.db-wal
+*.db-shm
+
+# Сгенерированные Tauri схемы
+**/gen/schemas
+
+# Отсебятина
+.env
+/.srcBuilders
+package-lock.json

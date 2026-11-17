@@ -1,0 +1,129 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  test-and-lint:
+    name: Тесты и линтеры
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Системные зависимости Linux (Tauri v2 / WebKitGTK 4.1)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libssl-dev libgtk-3-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: swatinem/rust-cache@v2
+
+      # generate_context! вшивает frontendDist на этапе КОМПИЛЯЦИИ, поэтому
+      # cargo test/clippy без собранного фронтенда падают на обоих приложениях.
+      - name: Сборка фронтендов обоих приложений
+        run: |
+          cd apps/receiver-micro && npm install && npm run build
+          cd ../uploader-desktop && npm install && npm run build
+
+      # Советующие проверки: уберите continue-on-error и добавьте -- -D warnings
+      # для clippy после первого локального `cargo fmt --all`.
+      - name: Форматирование (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: Clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+      - name: Тесты (blocking)
+        run: cargo test --workspace --verbose
+
+  build-release:
+    name: Релиз (${{ matrix.platform }})
+    needs: test-and-lint
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target universal-apple-darwin'
+            target_dir: 'target/universal-apple-darwin/release'
+            bin: 'receiver-micro'
+          - platform: ubuntu-22.04
+            args: ''
+            target_dir: 'target/release'
+            bin: 'receiver-micro'
+          - platform: windows-latest
+            args: ''
+            target_dir: 'target/release'
+            bin: 'receiver-micro.exe'
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Системные зависимости Linux
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf build-essential curl wget file libssl-dev libgtk-3-dev
+
+      # ЭТАП 1: портативный микро-клиент получателя (без установщика)
+      - name: Сборка receiver-micro
+        working-directory: apps/receiver-micro
+        run: |
+          npm install
+          npm run tauri build -- --no-bundle ${{ matrix.args }}
+
+      # ЭТАП 2: вшиваем его в ресурсы отправителя. Имя зафиксировано
+      # mainBinaryName в tauri.conf.json, поэтому путь предсказуем.
+      - name: Копирование шаблона в resources
+        shell: bash
+        run: |
+          mkdir -p apps/uploader-desktop/src-tauri/resources
+          cp "${{ matrix.target_dir }}/${{ matrix.bin }}" \
+             "apps/uploader-desktop/src-tauri/resources/${{ matrix.bin }}"
+
+      # ЭТАП 3: установщики отправителя + черновик релиза
+      - name: Зависимости фронтенда отправителя
+        working-directory: apps/uploader-desktop
+        run: npm install
+
+      - name: Сборка и публикация релиза
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/uploader-desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: 'SiaShare ${{ github.ref_name }}'
+          releaseBody: 'Сборка для Windows, Linux и macOS (Universal).'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
