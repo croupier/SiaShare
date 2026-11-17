@@ -163,6 +163,15 @@ where
     let mut packed = sdk.upload_packed(opts).map_err(sdk_err)?;
     for c in chunks {
         let mut file = File::open(&c.local_path).await?;
+        // Файл мог усохнуть между сканом и загрузкой: take() тогда тихо прочитал
+        // бы меньше байт, и получатель получил бы битый чанк. Лучше ошибка هنا.
+        let needed_end = c.offset_bytes.saturating_add(c.length_bytes);
+        if file.metadata().await?.len() < needed_end {
+            return Err(SiaClientError::Integrity(format!(
+                "{}: файл изменился (усечён) после постановки в очередь",
+                c.local_path
+            )));
+        }
         file.seek(SeekFrom::Start(c.offset_bytes)).await?;
         // AsyncReadExt::take читает строго `length_bytes` без загрузки чанка в ОЗУ
         packed

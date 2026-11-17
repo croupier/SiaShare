@@ -34,6 +34,7 @@
   let inflight = new Map<string, number>();
   let completedKeyBytes: number[] | null = null;
   let revoked = false;
+  let cleaned = false; // объекты сессии удалены из Sia (cleanup_session)
 
   $: inflightSum = [...inflight.values()].reduce((a, b) => a + b, 0);
   $: percent = totalChunks > 0
@@ -59,6 +60,7 @@
     lastChunkError = '';
     uploadError = s.status === 'failed' ? (s.last_error ?? 'Раздача не удалась') : '';
     revoked = s.status === 'revoked';
+    cleaned = s.status === 'cleaned';
     completedKeyBytes = (s.status === 'completed' || s.status === 'revoked') && s.seed_hex
       ? hexToBytes(s.seed_hex) : null;
   }
@@ -123,7 +125,7 @@
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
     // Сброс состояния прошлой раздачи
-    completedKeyBytes = null; revoked = false; uploadError = ''; lastChunkError = '';
+    completedKeyBytes = null; revoked = false; cleaned = false; uploadError = ''; lastChunkError = '';
     uploadedChunks = 0; totalChunks = 0; failedChunks = 0; inflight = new Map();
     try {
       activeSessionId = await invoke<string>('start_upload_session', { sessionName, paths, validDays });
@@ -154,6 +156,13 @@
     if (!confirm('Отозвать доступ? Уже начатые скачивания смогут продолжаться до ~5 минут.')) return;
     try { await invoke('revoke_session', { sessionId: activeSessionId }); revoked = true; }
     catch (e) { alert(`Ошибка отзыва: ${e}`); }
+  }
+
+  async function cleanupSession() {
+    if (!activeSessionId) return;
+    if (!confirm('Удалить загруженные объекты этой раздачи из Sia? Квота освободится, раздача станет недоступной навсегда.')) return;
+    try { await invoke('cleanup_session', { sessionId: activeSessionId }); cleaned = true; }
+    catch (e) { alert(`Ошибка очистки: ${e}`); }
   }
 </script>
 
@@ -216,7 +225,8 @@
         <div class="grid grid-cols-2 gap-4">
           <label class="block">
             <span class="mb-1.5 block text-sm font-medium text-slate-300">Срок жизни ссылки (дней)</span>
-            <input class="input" type="number" min="1" bind:value={validDays} />
+            <input class="input" type="number" min="0" bind:value={validDays} />
+            <span class="muted mt-1 block text-xs">0 — бессрочная раздача; отсчёт — с момента завершения загрузки</span>
           </label>
           <label class="block">
             <span class="mb-1.5 block text-sm font-medium text-slate-300">Пароль на скачивание</span>
@@ -249,6 +259,17 @@
       <div class="card mb-6 border-red-500/40 bg-red-500/10">
         <h3 class="mb-2 text-lg font-semibold text-red-300">Раздача не удалась</h3>
         <p class="text-sm text-red-300/90">{uploadError}</p>
+        {#if cleaned}
+          <p class="muted mt-3">Загруженные объекты удалены из Sia, квота освобождена.</p>
+        {:else}
+          <button class="btn-danger mt-4" on:click={cleanupSession}>Очистить квоту (удалить объекты)</button>
+        {/if}
+      </div>
+    {/if}
+
+    {#if cleaned && !uploadError && !completedKeyBytes}
+      <div class="card mb-6">
+        <p class="text-sm text-slate-300">Раздача удалена: объекты убраны из Sia, квота освобождена.</p>
       </div>
     {/if}
 
@@ -257,6 +278,11 @@
         <h3 class="mb-4 text-lg font-semibold text-emerald-300">Загрузка завершена!</h3>
         {#if revoked}
           <p class="text-sm text-amber-300">Доступ отозван — получатель больше не сможет скачать файлы.</p>
+          {#if cleaned}
+            <p class="muted mt-3">Объекты удалены из Sia, квота освобождена.</p>
+          {:else}
+            <button class="btn-danger mt-4" on:click={cleanupSession}>Очистить квоту (удалить объекты)</button>
+          {/if}
         {:else}
           <div class="flex flex-wrap gap-3">
             <button class="btn-primary" on:click={exportShareZip}>Сохранить Sia.zip для отправки</button>

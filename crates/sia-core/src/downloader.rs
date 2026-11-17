@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::Notify;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -65,13 +66,43 @@ fn dl_opts(offset: u64) -> DownloadOptions {
     }
 }
 
+/// Будит зависшее чтение при отмене: AtomicBool сам по себе не прерывает
+/// read, а замолчавший хост может держать его открытым сколько угодно.
+/// Watcher опрашивает флаг каждые 200 мс и будит select! через Notify
+/// (notify_one копит permit, поэтому сигнал не теряется между чтениями).
+/// Задача abort'ится в Drop — watcher живет ровно одно скачивание.
+struct CancelWatcher {
+    notify: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl CancelWatcher {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    n.notify_one();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        Self { notify, task }
+    }
+}
+impl Drop for CancelWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Скачивает один файл (1..N чанков) на диск с байтовой докачкой через .part.
 /// Отмена: cancel=true -> Err(Cancelled), .part сохраняется для продолжения.
 pub async fn download_single_file<F>(
     shared: &SharedSdk,
     entry: &SharedFileEntry,
     dest_path: &Path,
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     mut on_progress: F,
 ) -> Result<(), SiaClientError>
 where
@@ -95,11 +126,13 @@ where
     let mut out_file = OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false) // .part дописывается с existing_len, не перезаписывается
         .open(&part_path)
         .await?;
     out_file.set_len(existing_len).await?;
     out_file.seek(SeekFrom::Start(existing_len)).await?;
 
+    let watcher = CancelWatcher::new(cancel.clone());
     let mut downloaded = existing_len;
     let mut throttle = Throttle::new();
     on_progress(downloaded, entry.total_size);
@@ -132,7 +165,15 @@ where
                 out_file.flush().await?;
                 return Err(SiaClientError::Cancelled);
             }
-            let n = reader.read(&mut buf).await?;
+            // Отмена прерывает даже зависший read: недописанные байты не
+            // попадают в .part, докачка продолжится с длины файла на диске
+            let n = tokio::select! {
+                r = reader.read(&mut buf) => r?,
+                _ = watcher.notify.notified() => {
+                    out_file.flush().await?;
+                    return Err(SiaClientError::Cancelled);
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -189,6 +230,9 @@ where
     F: FnMut(u64, u64) + Send + 'static,
 {
     let handle = tokio::runtime::Handle::current();
+    // Watcher создаем в async-контексте и переносим в blocking-замыкание:
+    // его задача живет на рантайме, а select! читает notify внутри block_on
+    let watcher = CancelWatcher::new(cancel.clone());
     tokio::task::spawn_blocking(move || {
         let total_bytes: u64 = entries.iter().map(|e| e.total_size).sum();
         let mut downloaded = 0u64;
@@ -228,7 +272,12 @@ where
                             if cancel.load(Ordering::Relaxed) {
                                 return Err(SiaClientError::Cancelled);
                             }
-                            let n = reader.read(&mut buf).await?;
+                            let n = tokio::select! {
+                                r = reader.read(&mut buf) => r?,
+                                _ = watcher.notify.notified() => {
+                                    return Err(SiaClientError::Cancelled);
+                                }
+                            };
                             if n == 0 {
                                 break;
                             }

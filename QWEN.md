@@ -35,6 +35,9 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Не выдать битый файл как «целый» | Непрерывность `chunk_idx` 0..n−1, сходимость размеров, `downloaded == total_size` перед rename | `group_summaries_into_tree`, `download_single_file` |
 | Докачка | Отправитель — по чанкам из БД; получатель — до байта через `DownloadOptions.offset` и `.part` | `downloader.rs` |
 | Отзыв доступа | `revoke_sharing_key`; выданные токены доживают ~5 минут | `revoke_share` |
+| Срок жизни не съедается загрузкой | TTL отсчитывается от финализации; `validDays=0` → `expires_at=None` (вечная шара) | `worker.rs`, `db.rs` |
+| Проваленная раздача не держит квоту | `cleanup_session`: `delete_object` по id + `prune_slabs`, статус `cleaned` | `commands.rs` |
+| Отмена прерывает зависший хост | `CancelWatcher`: poll флага 200 мс + `Notify` + `select!` над read | `downloader.rs` |
 | AppKey не в plaintext | Системный keychain (`keyring` v3), запись `siashare-desktop` / `sia-app-key` | `commands.rs` |
 | Папки и ZIP >4 ГиБ | Синхронный `zip` с `large_file(true)` на `spawn_blocking`, мост async→sync через `Handle::block_on` | `download_as_zip` |
 | Малый переносимый receiver | Tauri v2 + Rust-ядро + тонкий Svelte; release: `opt-level="z"`, `lto`, `panic="abort"`, `strip` | корневой `Cargo.toml` |
@@ -103,7 +106,13 @@ build.ps1 / build.sh             17    receiver → resources → установ
 | `start_upload_session` | `sessionName, paths: string[], validDays` | `sessionId` |
 | `generate_share_zip` | `outputZipPath, sharingKeyBytes: number[], password` | `()` |
 | `revoke_session` | `sessionId` | `()` |
+| `cleanup_session` | `sessionId` | `()` |
 | `get_session_progress` | `sessionId` | `[total, uploaded, failed]` |
+
+`validDays >= 0`; **0 = бессрочная раздача**. TTL отсчитывается от успешной
+финализации, а не от создания сессии. `cleanup_session` удаляет объекты
+проваленной/отозванной раздачи (`failed`/`revoked` → `cleaned`) и освобождает
+квоту; для активной `completed`-раздачи команда возвращает ошибку.
 
 События: `auth-url` (string), `auth-phrase` (string), `chunk-progress`
 `{session_id,file_id,chunk_index,fraction}`, `session-progress` `{session_id,uploaded,total,failed}`,
@@ -139,8 +148,12 @@ Fallback — `key.sia` рядом с бинарником (подъём до 4 �
 `rel_path` — только прямые слеши, без `..`, `.`, пустых сегментов, `:` и `\`.
 
 **SQLite** (`storage/queue.db` в корне проекта у dev-сборки, иначе `%APPDATA%\com.siashare.uploader\queue.db`; WAL):
-- `upload_sessions(id,name,status,sharing_key_seed,last_error,expires_at,created_at)`
-  статусы: `uploading → finalizing → completed | failed | revoked`
+- `upload_sessions(id,name,status,sharing_key_seed,last_error,expires_at,ttl_seconds,created_at)`
+  статусы: `uploading → finalizing → completed | failed | revoked`;
+  `failed/revoked → cleaned` (объекты удалены командой `cleanup_session`).
+  `ttl_seconds` — срок жизни от финализации (0 = бессрочно); `expires_at`
+  вычисляется при финализации. У старых строк `ttl_seconds=NULL` — для них
+  `expires_at` остается абсолютным timestamp (миграция ALTER ADD COLUMN).
 - `upload_files(id,session_id,local_path,rel_path,total_size,chunk_size,total_chunks)`
   + UNIQUE(session_id, rel_path)
 - `upload_chunks(file_id,chunk_index,offset_bytes,length_bytes,status,sia_object_id,attempts,last_error)`
@@ -254,7 +267,8 @@ Zed: перезапускать целиком после установки т�
    решение отложено сознательно; интеграционные прогоны делаются вручную на бою
    (см. раздел 8), юнит-тесты чистого кода (`crypto`, `db`, `models`) это не отменяет.
 6. `upload_packed` не используется: мелкие файлы паддятся до слаба, квота тратится зря.
-7. `fmt`/`clippy` в CI — advisory; ужесточить после `cargo fmt --all`.
+7. `fmt`/`clippy` в CI — advisory; `cargo fmt --all` применён (2026-11-18),
+   clippy без предупреждений — можно ужесточать CI.
 8. `opt-level="z"` применяется и к отправителю; можно поднять до 3 через
    `[profile.release.package.uploader-desktop]` (per-package работает только для `opt-level`).
 

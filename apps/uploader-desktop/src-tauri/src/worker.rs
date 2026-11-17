@@ -176,14 +176,20 @@ pub fn start_upload_workers(
                             );
                             tokio::time::sleep(delay).await;
                             for task in &tasks {
-                                let failed = db
-                                    .record_chunk_error(
-                                        &task.file_id,
-                                        task.chunk_index,
-                                        &err.to_string(),
-                                        MAX_CHUNK_ATTEMPTS,
-                                    )
-                                    .unwrap_or(false);
+                                let failed = match db.record_chunk_error(
+                                    &task.file_id,
+                                    task.chunk_index,
+                                    &err.to_string(),
+                                    MAX_CHUNK_ATTEMPTS,
+                                ) {
+                                    Ok(f) => f,
+                                    Err(e) => {
+                                        // Чанк останется 'uploading' до перезапуска,
+                                        // тогда db.init сбросит его в pending
+                                        eprintln!("БД: не удалось записать ошибку чанка: {e}");
+                                        false
+                                    }
+                                };
                                 let _ = app.emit("chunk-error", serde_json::json!({
                                     "session_id": task.session_id, "chunk_index": task.chunk_index,
                                     "error": err.to_string(), "failed": failed,
@@ -236,6 +242,7 @@ pub fn start_upload_workers(
                             "финализация не удалась".to_string(),
                         ),
                     );
+                    attempts.remove(&task.session_id);
                     continue;
                 }
 
@@ -246,10 +253,21 @@ pub fn start_upload_workers(
                         .iter()
                         .map(|s| parse_object_id(s).map_err(|e| e.to_string()))
                         .collect::<Result<_, _>>()?;
-                    // TTL — из БД (выбор пользователя), а не хардкод 7 дней
-                    let expires = task
-                        .expires_at
-                        .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0));
+                    // TTL отсчитывается от ФИНАЛИЗАЦИИ: ключ создается здесь, и
+                    // долгая загрузка не должна съедать срок жизни раздачи.
+                    // ttl_seconds=0 — вечная шара (SDK: expires_at=None = no expiry).
+                    // Старые строки БД (ttl_seconds=NULL): expires_at — абсолютный.
+                    let expires = match task.ttl_seconds {
+                        Some(0) => None,
+                        Some(ttl) => Some(
+                            chrono::Duration::try_seconds(ttl)
+                                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
+                                .ok_or_else(|| "срок жизни раздачи слишком велик".to_string())?,
+                        ),
+                        None => task
+                            .expires_at
+                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
+                    };
                     let existing = task
                         .seed_hex
                         .as_deref()

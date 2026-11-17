@@ -135,7 +135,7 @@ pub async fn download_one(
         &sdk,
         &entry,
         &PathBuf::from(save_to),
-        &cancel,
+        cancel,
         |downloaded, total| {
             // троттлинг уже внутри downloader'а — здесь просто emit
             let _ = app.emit("download-progress", DownloadProgress { downloaded, total });

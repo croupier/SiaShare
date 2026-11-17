@@ -1,7 +1,8 @@
 use crate::db::Database;
 use sia_core::crypto::build_receiver_filename;
 use sia_core::sia_client::{
-    begin_connection, connect_with_app_key, ensure_capacity, finish_connection, revoke_share,
+    begin_connection, connect_with_app_key, ensure_capacity, finish_connection, parse_object_id,
+    revoke_share,
 };
 use sia_storage::Sdk;
 use std::collections::HashSet;
@@ -104,9 +105,14 @@ pub async fn start_upload_session(
     valid_days: i64,
     state: State<'_, UploaderState>,
 ) -> Result<String, String> {
-    if valid_days <= 0 {
-        return Err("Срок жизни ссылки должен быть >= 1 дня".into());
+    if valid_days < 0 {
+        return Err("Срок жизни ссылки не может быть отрицательным".into());
     }
+    // 0 = бессрочная раздача. TTL отсчитывается от успешной финализации,
+    // а не от создания сессии — долгая загрузка не съедает срок жизни.
+    let ttl_seconds = valid_days
+        .checked_mul(86400)
+        .ok_or("Срок жизни ссылки слишком велик")?;
     let sdk = current_sdk(&state)?;
 
     let mut collected = collect_files_recursive(&paths)?;
@@ -121,10 +127,9 @@ pub async fn start_upload_session(
         .await
         .map_err(|e| e.to_string())?;
 
-    let expires_at = chrono::Utc::now().timestamp() + valid_days * 86400;
     state
         .db
-        .create_session(&session_name, &collected, expires_at)
+        .create_session(&session_name, &collected, ttl_seconds)
         .map_err(|e| format!("Ошибка БД: {e}"))
 }
 
@@ -139,7 +144,7 @@ fn dedupe_rel_paths(files: &mut [(String, String, u64)]) {
         let p = Path::new(rel.as_str());
         let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("file");
         let ext = p.extension().and_then(|s| s.to_str());
-        let parent = p.parent().filter(|x| x.as_os_str().len() > 0);
+        let parent = p.parent().filter(|x| !x.as_os_str().is_empty());
         for i in 2.. {
             let name = match ext {
                 Some(e) => format!("{stem} ({i}).{e}"),
@@ -270,6 +275,52 @@ pub async fn revoke_session(
     state
         .db
         .mark_session_revoked(&session_id)
+        .map_err(|e| e.to_string())
+}
+
+/// 6. Очистка квоты: удаляет объекты проваленной/отозванной раздачи и подчищает
+/// незакрепленные слабы (сироты неудачных попыток не имеют id в БД).
+/// Активную (completed) раздачу удалить нельзя — по ней еще качают получатели.
+#[tauri::command]
+pub async fn cleanup_session(
+    session_id: String,
+    state: State<'_, UploaderState>,
+) -> Result<(), String> {
+    let sdk = current_sdk(&state)?;
+    let status = state
+        .db
+        .session_status(&session_id)
+        .map_err(|e| e.to_string())?
+        .ok_or("Сессия не найдена")?;
+    if status != "failed" && status != "revoked" {
+        return Err("Очистка доступна только для проваленных или отозванных раздач".into());
+    }
+    let ids = state
+        .db
+        .session_object_ids(&session_id)
+        .map_err(|e| e.to_string())?;
+    let mut errors = 0usize;
+    for id in &ids {
+        match parse_object_id(id) {
+            Ok(h) => {
+                if sdk.delete_object(&h).await.is_err() {
+                    errors += 1;
+                }
+            }
+            Err(_) => errors += 1,
+        }
+    }
+    // Не помечаем cleaned при сетевых сбоях: часть объектов осталась бы в квоте
+    if errors > 0 {
+        return Err(format!(
+            "Не удалось удалить {errors} из {} объектов — повторите при доступной сети",
+            ids.len()
+        ));
+    }
+    let _ = sdk.prune_slabs(None).await;
+    state
+        .db
+        .mark_session_cleaned(&session_id)
         .map_err(|e| e.to_string())
 }
 

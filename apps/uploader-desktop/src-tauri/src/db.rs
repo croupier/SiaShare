@@ -42,7 +42,10 @@ pub struct SessionInfo {
 pub struct FinalizeTask {
     pub session_id: String,
     pub name: String,
+    /// Абсолютный timestamp из старых строк БД (ttl_seconds = NULL)
     pub expires_at: Option<i64>,
+    /// Срок жизни от финализации, секунды; 0 = бессрочно; NULL = старая строка
+    pub ttl_seconds: Option<i64>,
     /// Seed уже созданного SharingKey (hex) — переиспользуется при повторе финализации
     pub seed_hex: Option<String>,
 }
@@ -60,11 +63,17 @@ impl Database {
             CREATE TABLE IF NOT EXISTS upload_sessions(
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL,
-                -- uploading -> finalizing -> completed | failed | revoked
+                -- uploading -> finalizing -> completed | failed | revoked;
+                -- failed/revoked -> cleaned (объекты удалены, квота освобождена)
                 status TEXT NOT NULL,
                 sharing_key_seed TEXT,
                 last_error TEXT,
+                -- Абсолютный timestamp; заполнялся при создании в старых версиях.
+                -- Новые сессии хранят ttl_seconds, а expires_at вычисляется при финализации.
                 expires_at INTEGER,
+                -- Срок жизни от момента финализации, секунды; 0 = бессрочно.
+                -- NULL у старых строк — для них expires_at остается абсолютным.
+                ttl_seconds INTEGER,
                 created_at INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS upload_files(
@@ -95,6 +104,16 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_chunks_status ON upload_chunks(status);
             ",
         )?;
+        // Миграция существующих БД: колонка ttl_seconds появилась позже.
+        // "duplicate column" = колонка уже есть (новая схема или повторный запуск).
+        if let Err(e) = conn.execute(
+            "ALTER TABLE upload_sessions ADD COLUMN ttl_seconds INTEGER",
+            [],
+        ) {
+            if !e.to_string().contains("duplicate column") {
+                return Err(e);
+            }
+        }
         // Восстанавливаем чанки, зависшие при закрытии программы. Безопасно только
         // при single-instance: второй экземпляр сбросил бы чанки работающего первого.
         conn.execute(
@@ -108,33 +127,34 @@ impl Database {
     }
 
     /// Создает сессию и нарезает файлы на чанки по 256 МиБ.
+    /// ttl_seconds — срок жизни раздачи ОТ МОМЕНТА ФИНАЛИЗАЦИИ; 0 = бессрочно.
     pub fn create_session(
         &self,
         session_name: &str,
         files: &[(String, String, u64)], // (local_path, rel_path, total_size)
-        expires_at: i64,
+        ttl_seconds: i64,
     ) -> Result<String> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
         let session_id = Uuid::new_v4().to_string();
         let now = chrono::Utc::now().timestamp();
         tx.execute(
-            "INSERT INTO upload_sessions(id,name,status,expires_at,created_at) VALUES(?1,?2,'uploading',?3,?4)",
-            params![session_id, session_name, expires_at, now],
+            "INSERT INTO upload_sessions(id,name,status,ttl_seconds,created_at) VALUES(?1,?2,'uploading',?3,?4)",
+            params![session_id, session_name, ttl_seconds, now],
         )?;
         for (local_path, rel_path, total_size) in files {
             let file_id = Uuid::new_v4().to_string();
             let total_chunks = if *total_size == 0 {
                 1
             } else {
-                (*total_size + DEFAULT_CHUNK_SIZE - 1) / DEFAULT_CHUNK_SIZE
+                total_size.div_ceil(DEFAULT_CHUNK_SIZE)
             };
             tx.execute(
                 "INSERT INTO upload_files(id,session_id,local_path,rel_path,total_size,chunk_size,total_chunks) VALUES(?1,?2,?3,?4,?5,?6,?7)",
                 params![file_id, session_id, local_path, rel_path, *total_size as i64, DEFAULT_CHUNK_SIZE as i64, total_chunks],
             )?;
             for idx in 0..total_chunks {
-                let offset = idx as u64 * DEFAULT_CHUNK_SIZE;
+                let offset = idx * DEFAULT_CHUNK_SIZE;
                 let length = if *total_size == 0 {
                     0
                 } else {
@@ -341,21 +361,21 @@ impl Database {
     pub fn next_finalizing_session(&self) -> Result<Option<FinalizeTask>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id,name,expires_at,sharing_key_seed FROM upload_sessions
+            "SELECT id,name,expires_at,ttl_seconds,sharing_key_seed FROM upload_sessions
              WHERE status='finalizing' ORDER BY created_at ASC LIMIT 1",
         )?;
         let mut rows = stmt.query([])?;
-        Ok(rows
-            .next()?
+        rows.next()?
             .map(|r| -> Result<FinalizeTask> {
                 Ok(FinalizeTask {
                     session_id: r.get(0)?,
                     name: r.get(1)?,
                     expires_at: r.get(2)?,
-                    seed_hex: r.get(3)?,
+                    ttl_seconds: r.get(3)?,
+                    seed_hex: r.get(4)?,
                 })
             })
-            .transpose()?)
+            .transpose()
     }
 
     /// Сохраняем seed СРАЗУ после создания ключа: повтор финализации не должен
@@ -391,6 +411,30 @@ impl Database {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "UPDATE upload_sessions SET status='revoked' WHERE id=?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Текущий статус сессии (None = сессии нет).
+    pub fn session_status(&self, session_id: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        match conn.query_row(
+            "SELECT status FROM upload_sessions WHERE id=?1",
+            params![session_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            Ok(s) => Ok(Some(s)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Объекты сессии удалены из Sia, квота освобождена (после cleanup_session).
+    pub fn mark_session_cleaned(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE upload_sessions SET status='cleaned' WHERE id=?1",
             params![session_id],
         )?;
         Ok(())
@@ -484,7 +528,9 @@ mod tests {
         assert!(!db.try_begin_finalize(&sid).unwrap()); // повторно — уже finalizing
         let f = db.next_finalizing_session().unwrap().unwrap();
         assert_eq!(f.session_id, sid);
-        assert_eq!(f.expires_at, Some(123));
+        // TTL хранится как есть; абсолютный expires_at вычислит финализатор
+        assert_eq!(f.ttl_seconds, Some(123));
+        assert_eq!(f.expires_at, None);
         db.save_session_seed(&sid, &"cc".repeat(32)).unwrap();
         assert_eq!(
             db.next_finalizing_session().unwrap().unwrap().seed_hex,
@@ -537,5 +583,54 @@ mod tests {
             .unwrap()
             .is_empty());
         assert!(!db.try_begin_finalize(&sid).unwrap());
+    }
+
+    #[test]
+    fn test_cleanup_status_flow() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        let sid = db
+            .create_session("S", &[("p".into(), "f".into(), 10)], 0)
+            .unwrap();
+        assert_eq!(
+            db.session_status(&sid).unwrap().as_deref(),
+            Some("uploading")
+        );
+        assert_eq!(db.session_status("no-such-id").unwrap(), None);
+        db.mark_session_failed(&sid, "net").unwrap();
+        db.mark_session_cleaned(&sid).unwrap();
+        assert_eq!(db.session_status(&sid).unwrap().as_deref(), Some("cleaned"));
+        // Очищенная сессия не попадает ни в очередь воркеров, ни к финализатору
+        assert!(db
+            .claim_next_pending_batch(DEFAULT_CHUNK_SIZE)
+            .unwrap()
+            .is_empty());
+        assert!(db.next_finalizing_session().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_migration_adds_ttl_to_legacy_db() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        // Схема старой версии: без ttl_seconds, expires_at заполнялся при создании
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE upload_sessions(
+                id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+                sharing_key_seed TEXT, last_error TEXT, expires_at INTEGER,
+                created_at INTEGER NOT NULL);
+             INSERT INTO upload_sessions(id,name,status,expires_at,created_at)
+                VALUES('old','Legacy','finalizing',1893456000,1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let db = Database::init(&db_path).unwrap();
+        let f = db.next_finalizing_session().unwrap().unwrap();
+        assert_eq!(f.session_id, "old");
+        assert_eq!(f.ttl_seconds, None); // старая строка — абсолютный expires_at
+        assert_eq!(f.expires_at, Some(1893456000));
+        // Повторный init не падает на уже существующей колонке
+        Database::init(&db_path).unwrap();
     }
 }

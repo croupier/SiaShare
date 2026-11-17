@@ -5,8 +5,8 @@ mod db;
 mod worker;
 
 use commands::{
-    check_saved_auth, connect_sia, generate_share_zip, get_session_progress, list_sessions,
-    revoke_session, start_upload_session, UploaderState,
+    check_saved_auth, cleanup_session, connect_sia, generate_share_zip, get_session_progress,
+    list_sessions, revoke_session, start_upload_session, UploaderState,
 };
 use db::Database;
 use std::path::PathBuf;
@@ -30,22 +30,6 @@ fn queue_db_path(app: &AppHandle) -> PathBuf {
 fn project_root(exe: &std::path::Path) -> Option<&std::path::Path> {
     exe.ancestors()
         .find(|d| d.join("Cargo.toml").is_file() && d.join("crates").is_dir())
-}
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn test_project_root_detection() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
-        std::fs::create_dir(dir.path().join("crates")).unwrap();
-        let exe = dir.path().join("target").join("debug").join("app.exe");
-        assert_eq!(super::project_root(&exe), Some(dir.path()));
-        // установленная сборка вне workspace — корня нет
-        let outside = tempfile::tempdir().unwrap();
-        let exe2 = outside.path().join("app.exe");
-        assert_eq!(super::project_root(&exe2), None);
-    }
 }
 
 fn main() {
@@ -77,9 +61,26 @@ fn main() {
             start_upload_session,
             generate_share_zip,
             revoke_session,
+            cleanup_session,
             get_session_progress,
             list_sessions
         ])
         .run(tauri::generate_context!())
         .expect("Ошибка запуска uploader-desktop");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_project_root_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir(dir.path().join("crates")).unwrap();
+        let exe = dir.path().join("target").join("debug").join("app.exe");
+        assert_eq!(super::project_root(&exe), Some(dir.path()));
+        // установленная сборка вне workspace — корня нет
+        let outside = tempfile::tempdir().unwrap();
+        let exe2 = outside.path().join("app.exe");
+        assert_eq!(super::project_root(&exe2), None);
+    }
 }
