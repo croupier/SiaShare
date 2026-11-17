@@ -8,6 +8,7 @@ apps/uploader-desktop/src-tauri/resources/receiver-micro
 apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
 
 # Локальная очередь загрузок
+/storage/
 *.db
 *.db-wal
 *.db-shm

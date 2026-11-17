@@ -138,7 +138,7 @@ Fallback — `key.sia` рядом с бинарником (подъём до 4 �
 `rel_path, chunk_idx, total_chunks, total_file_size, chunk_size`.
 `rel_path` — только прямые слеши, без `..`, `.`, пустых сегментов, `:` и `\`.
 
-**SQLite** (`%APPDATA%\com.siashare.uploader\queue.db`, WAL):
+**SQLite** (`storage/queue.db` в корне проекта у dev-сборки, иначе `%APPDATA%\com.siashare.uploader\queue.db`; WAL):
 - `upload_sessions(id,name,status,sharing_key_seed,last_error,expires_at,created_at)`
   статусы: `uploading → finalizing → completed | failed | revoked`
 - `upload_files(id,session_id,local_path,rel_path,total_size,chunk_size,total_chunks)`
