@@ -42,7 +42,10 @@ pub fn sanitize_rel_path(path: &str) -> Option<String> {
     if path.contains('\\') || path.contains(':') || path.starts_with('/') {
         return None;
     }
-    if path.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..") {
+    if path
+        .split('/')
+        .any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
         return None;
     }
     Some(path.to_string())

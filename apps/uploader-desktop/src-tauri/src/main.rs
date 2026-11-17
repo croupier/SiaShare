@@ -21,7 +21,10 @@ fn queue_db_path(app: &AppHandle) -> PathBuf {
             return root.join("storage").join("queue.db");
         }
     }
-    app.path().app_data_dir().expect("каталог данных приложения").join("queue.db")
+    app.path()
+        .app_data_dir()
+        .expect("каталог данных приложения")
+        .join("queue.db")
 }
 
 fn project_root(exe: &std::path::Path) -> Option<&std::path::Path> {

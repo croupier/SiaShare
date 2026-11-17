@@ -2,7 +2,7 @@ use crate::models::{sanitize_rel_path, ChunkMetadata, SharedFileEntry};
 use chrono::{DateTime, Utc};
 use sia_storage::{
     app_id, AppKey, AppMetadata, Builder, Hash256, Object, PackedUploadOptions,
-    RequestingApprovalState, Sdk, SharedSdk, SharingKey, SharingKeyOptions, ShardProgress,
+    RequestingApprovalState, Sdk, ShardProgress, SharedSdk, SharingKey, SharingKeyOptions,
 };
 use std::collections::HashMap;
 use thiserror::Error;
@@ -53,7 +53,8 @@ fn sdk_err<E: std::fmt::Display>(e: E) -> SiaClientError {
 
 /// Hex-строка -> Hash256 (Display/FromStr у Hash256 — hex).
 pub fn parse_object_id(s: &str) -> Result<Hash256, SiaClientError> {
-    s.parse::<Hash256>().map_err(|e| SiaClientError::InvalidKey(format!("id объекта '{s}': {e}")))
+    s.parse::<Hash256>()
+        .map_err(|e| SiaClientError::InvalidKey(format!("id объекта '{s}': {e}")))
 }
 
 /// Возврат пользователя по сохраненному AppKey (32 байта из keyring).
@@ -89,7 +90,12 @@ pub async fn finish_connection(
     let approved = builder.wait_for_approval().await.map_err(sdk_err)?;
     let (phrase, generated) = match phrase {
         Some(p) => {
-            if approved.reconnecting() && !approved.matches_existing_app_key(&p).await.map_err(sdk_err)? {
+            if approved.reconnecting()
+                && !approved
+                    .matches_existing_app_key(&p)
+                    .await
+                    .map_err(sdk_err)?
+            {
                 return Err(SiaClientError::PhraseMismatch);
             }
             (p, None)
@@ -159,7 +165,10 @@ where
         let mut file = File::open(&c.local_path).await?;
         file.seek(SeekFrom::Start(c.offset_bytes)).await?;
         // AsyncReadExt::take читает строго `length_bytes` без загрузки чанка в ОЗУ
-        packed.add(file.take(c.length_bytes)).await.map_err(sdk_err)?;
+        packed
+            .add(file.take(c.length_bytes))
+            .await
+            .map_err(sdk_err)?;
     }
     let mut objects = packed.finalize().await.map_err(sdk_err)?;
     for (obj, c) in objects.iter_mut().zip(chunks) {
@@ -185,14 +194,19 @@ pub async fn share_session_objects(
     let sharing_key = match existing_seed {
         Some(seed) => SharingKey::import(seed),
         None => sdk
-            .create_sharing_key(SharingKeyOptions { description: description.to_string(), expires_at })
+            .create_sharing_key(SharingKeyOptions {
+                description: description.to_string(),
+                expires_at,
+            })
             .await
             .map_err(sdk_err)?,
     };
     for id in object_ids {
         // В БД хранятся только идентификаторы; полный Object догружаем по id.
         let obj = sdk.object(id).await.map_err(sdk_err)?;
-        sdk.share_object(&sharing_key, &obj).await.map_err(sdk_err)?;
+        sdk.share_object(&sharing_key, &obj)
+            .await
+            .map_err(sdk_err)?;
     }
     Ok(sharing_key.export())
 }
@@ -200,7 +214,9 @@ pub async fn share_session_objects(
 /// Досрочный отзыв доступа. ВНИМАНИЕ: уже выданные токены скачивания живут
 /// до ~5 минут после отзыва — это не мгновенный обрыв.
 pub async fn revoke_share(sdk: &Sdk, seed: [u8; 32]) -> Result<(), SiaClientError> {
-    sdk.revoke_sharing_key(&SharingKey::import(seed)).await.map_err(sdk_err)
+    sdk.revoke_sharing_key(&SharingKey::import(seed))
+        .await
+        .map_err(sdk_err)
 }
 
 /// Подключение получателя: read-only SharedSdk по 32-байтному seed.
@@ -210,7 +226,9 @@ pub async fn connect_shared(sharing_key_bytes: &[u8]) -> Result<SharedSdk, SiaCl
     let seed: [u8; 32] = sharing_key_bytes
         .try_into()
         .map_err(|_| SiaClientError::InvalidKey("SharingKey должен быть 32 байта".into()))?;
-    SharedSdk::connect(DEFAULT_INDEXER_URL, seed).await.map_err(sdk_err)
+    SharedSdk::connect(DEFAULT_INDEXER_URL, seed)
+        .await
+        .map_err(sdk_err)
 }
 
 /// Восстанавливает дерево файлов из плоского списка объектов Sia.
@@ -220,7 +238,10 @@ pub async fn fetch_shared_tree(shared: &SharedSdk) -> Result<Vec<SharedFileEntry
     let mut items: Vec<(String, Vec<u8>)> = Vec::new();
     let mut offset: u64 = 0;
     loop {
-        let page = shared.object_summaries(Some(offset), Some(PAGE)).await.map_err(sdk_err)?;
+        let page = shared
+            .object_summaries(Some(offset), Some(PAGE))
+            .await
+            .map_err(sdk_err)?;
         let got = page.len() as u64;
         items.extend(page.into_iter().map(|s| (s.id.to_string(), s.metadata)));
         if got < PAGE {
@@ -233,14 +254,24 @@ pub async fn fetch_shared_tree(shared: &SharedSdk) -> Result<Vec<SharedFileEntry
 
 /// Чистая функция группировки. НЕ проглатывает ошибки: битые метаданные,
 /// дыры в индексах, дубликаты и несовпадение размеров = ошибка целостности.
-pub fn group_summaries_into_tree(items: Vec<(String, Vec<u8>)>) -> Result<Vec<SharedFileEntry>, SiaClientError> {
+pub fn group_summaries_into_tree(
+    items: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<SharedFileEntry>, SiaClientError> {
     let mut grouped: HashMap<String, Vec<(u32, String, ChunkMetadata)>> = HashMap::new();
     for (object_id, meta_bytes) in items {
-        let meta: ChunkMetadata = serde_json::from_slice(&meta_bytes)
-            .map_err(|e| SiaClientError::Integrity(format!("объект {object_id}: битые метаданные: {e}")))?;
-        let rel = sanitize_rel_path(&meta.rel_path)
-            .ok_or_else(|| SiaClientError::Integrity(format!("небезопасный путь в метаданных: {:?}", meta.rel_path)))?;
-        grouped.entry(rel).or_default().push((meta.chunk_idx, object_id, meta));
+        let meta: ChunkMetadata = serde_json::from_slice(&meta_bytes).map_err(|e| {
+            SiaClientError::Integrity(format!("объект {object_id}: битые метаданные: {e}"))
+        })?;
+        let rel = sanitize_rel_path(&meta.rel_path).ok_or_else(|| {
+            SiaClientError::Integrity(format!(
+                "небезопасный путь в метаданных: {:?}",
+                meta.rel_path
+            ))
+        })?;
+        grouped
+            .entry(rel)
+            .or_default()
+            .push((meta.chunk_idx, object_id, meta));
     }
 
     let mut files = Vec::with_capacity(grouped.len());
@@ -250,25 +281,37 @@ pub fn group_summaries_into_tree(items: Vec<(String, Vec<u8>)>) -> Result<Vec<Sh
         let first = &chunks[0].2;
         let (total, cs, n) = (first.total_file_size, first.chunk_size, first.total_chunks);
         if cs == 0 || chunks.len() != n as usize {
-            return Err(SiaClientError::Integrity(format!("{rel_path}: получено {} чанков из {n}", chunks.len())));
+            return Err(SiaClientError::Integrity(format!(
+                "{rel_path}: получено {} чанков из {n}",
+                chunks.len()
+            )));
         }
         for (i, (idx, _, m)) in chunks.iter().enumerate() {
             // непрерывность 0..n-1 ловит и дыры, и дубликаты
             if *idx != i as u32 {
-                return Err(SiaClientError::Integrity(format!("{rel_path}: дыра/дубликат индексов (ожидался {i}, получен {idx})")));
+                return Err(SiaClientError::Integrity(format!(
+                    "{rel_path}: дыра/дубликат индексов (ожидался {i}, получен {idx})"
+                )));
             }
             if m.total_file_size != total || m.chunk_size != cs || m.total_chunks != n {
-                return Err(SiaClientError::Integrity(format!("{rel_path}: метаданные чанков противоречат друг другу")));
+                return Err(SiaClientError::Integrity(format!(
+                    "{rel_path}: метаданные чанков противоречат друг другу"
+                )));
             }
         }
         // Размерная сходимость: (n-1)*cs < total <= n*cs; пустой файл = 1 чанк, 0 байт.
         let dim_ok = if total == 0 {
             n == 1
         } else {
-            (n as u64).checked_mul(cs).map(|max| (n as u64 - 1) * cs < total && total <= max).unwrap_or(false)
+            (n as u64)
+                .checked_mul(cs)
+                .map(|max| (n as u64 - 1) * cs < total && total <= max)
+                .unwrap_or(false)
         };
         if !dim_ok {
-            return Err(SiaClientError::Integrity(format!("{rel_path}: размеры не сходятся (total={total}, chunk_size={cs}, n={n})")));
+            return Err(SiaClientError::Integrity(format!(
+                "{rel_path}: размеры не сходятся (total={total}, chunk_size={cs}, n={n})"
+            )));
         }
         files.push(SharedFileEntry {
             rel_path,
@@ -287,7 +330,13 @@ mod tests {
     use super::*;
 
     fn meta(idx: u32, n: u32, total: u64, cs: u64) -> ChunkMetadata {
-        ChunkMetadata { rel_path: "Folder/movie.mkv".into(), chunk_idx: idx, total_chunks: n, total_file_size: total, chunk_size: cs }
+        ChunkMetadata {
+            rel_path: "Folder/movie.mkv".into(),
+            chunk_idx: idx,
+            total_chunks: n,
+            total_file_size: total,
+            chunk_size: cs,
+        }
     }
     fn item(id: &str, m: &ChunkMetadata) -> (String, Vec<u8>) {
         (id.into(), serde_json::to_vec(m).unwrap())
@@ -295,7 +344,10 @@ mod tests {
 
     #[test]
     fn test_group_summaries_sorts_chunks_correctly() {
-        let items = vec![item("second", &meta(1, 2, 500, 256)), item("first", &meta(0, 2, 500, 256))];
+        let items = vec![
+            item("second", &meta(1, 2, 500, 256)),
+            item("first", &meta(0, 2, 500, 256)),
+        ];
         let tree = group_summaries_into_tree(items).unwrap();
         assert_eq!(tree.len(), 1);
         assert_eq!(tree[0].chunk_object_ids, vec!["first", "second"]);
@@ -309,13 +361,19 @@ mod tests {
 
     #[test]
     fn test_duplicate_index_is_error() {
-        let items = vec![item("a", &meta(0, 2, 500, 256)), item("b", &meta(0, 2, 500, 256))];
+        let items = vec![
+            item("a", &meta(0, 2, 500, 256)),
+            item("b", &meta(0, 2, 500, 256)),
+        ];
         assert!(group_summaries_into_tree(items).is_err());
     }
 
     #[test]
     fn test_size_mismatch_is_error() {
-        let items = vec![item("a", &meta(0, 2, 900, 256)), item("b", &meta(1, 2, 900, 256))];
+        let items = vec![
+            item("a", &meta(0, 2, 900, 256)),
+            item("b", &meta(1, 2, 900, 256)),
+        ];
         assert!(group_summaries_into_tree(items).is_err());
     }
 

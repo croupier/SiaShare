@@ -18,7 +18,10 @@ use zip::{CompressionMethod, ZipWriter};
 /// записи, поэтому продолжать можно с произвольного смещения, а не только
 /// с границы чанка.
 pub fn calculate_resume_chunk(existing_part_size: u64, chunk_size: u64) -> (usize, u64) {
-    ((existing_part_size / chunk_size) as usize, existing_part_size % chunk_size)
+    (
+        (existing_part_size / chunk_size) as usize,
+        existing_part_size % chunk_size,
+    )
 }
 
 /// Ожидаемая длина чанка idx: последний чанк короче, пустой файл = 0.
@@ -26,7 +29,9 @@ fn expected_chunk_len(entry: &SharedFileEntry, idx: usize) -> u64 {
     if entry.total_size == 0 {
         0
     } else {
-        entry.chunk_size.min(entry.total_size - idx as u64 * entry.chunk_size)
+        entry
+            .chunk_size
+            .min(entry.total_size - idx as u64 * entry.chunk_size)
     }
 }
 
@@ -38,7 +43,10 @@ impl Throttle {
         Self(None)
     }
     fn tick(&mut self, force: bool) -> bool {
-        let due = self.0.map(|t| t.elapsed() >= Duration::from_millis(200)).unwrap_or(true);
+        let due = self
+            .0
+            .map(|t| t.elapsed() >= Duration::from_millis(200))
+            .unwrap_or(true);
         if force || due {
             self.0 = Some(Instant::now());
             true
@@ -84,7 +92,11 @@ where
     }
     let (completed_chunks, partial) = calculate_resume_chunk(existing_len, entry.chunk_size);
 
-    let mut out_file = OpenOptions::new().create(true).write(true).open(&part_path).await?;
+    let mut out_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .open(&part_path)
+        .await?;
     out_file.set_len(existing_len).await?;
     out_file.seek(SeekFrom::Start(existing_len)).await?;
 
@@ -103,9 +115,14 @@ where
             continue;
         }
         let id = parse_object_id(object_id)?;
-        let obj = shared.object(&id).await.map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+        let obj = shared
+            .object(&id)
+            .await
+            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
         // download — СИНХРОННЫЙ метод, возвращает AsyncRead-хэндл; drop = отмена
-        let reader = shared.download(&obj, dl_opts(skip)).map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+        let reader = shared
+            .download(&obj, dl_opts(skip))
+            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
         let mut reader = std::pin::pin!(reader);
 
         let mut chunk_read = 0u64;
@@ -130,7 +147,9 @@ where
         if skip + chunk_read != expected {
             return Err(SiaClientError::Integrity(format!(
                 "{}: чанк {idx} скачан на {} байт вместо {}",
-                entry.rel_path, skip + chunk_read, expected
+                entry.rel_path,
+                skip + chunk_read,
+                expected
             )));
         }
     }
@@ -138,7 +157,10 @@ where
     // Финальная проверка РАЗМЕРА: без нее недостающий чанк превратился бы
     // в "успешно скачанный" битый файл.
     if downloaded != entry.total_size {
-        return Err(SiaClientError::Integrity(format!("{}: скачано {downloaded} байт из {}", entry.rel_path, entry.total_size)));
+        return Err(SiaClientError::Integrity(format!(
+            "{}: скачано {downloaded} байт из {}",
+            entry.rel_path, entry.total_size
+        )));
     }
     out_file.flush().await?;
     drop(out_file);
@@ -178,21 +200,28 @@ where
         let result = (|| -> Result<(), SiaClientError> {
             for entry in &entries {
                 // rel_path из чужих метаданных — повторно санитизируем (zip-slip)
-                let name = sanitize_rel_path(&entry.rel_path)
-                    .ok_or_else(|| SiaClientError::Integrity(format!("небезопасный путь: {:?}", entry.rel_path)))?;
+                let name = sanitize_rel_path(&entry.rel_path).ok_or_else(|| {
+                    SiaClientError::Integrity(format!("небезопасный путь: {:?}", entry.rel_path))
+                })?;
                 // Stored: файлы уже сжаты/зашифрованы — не тратим CPU повторно
                 let options = SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Stored)
                     .large_file(true)
                     .unix_permissions(0o644);
-                zip.start_file(name, options).map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                zip.start_file(name, options)
+                    .map_err(|e| SiaClientError::Zip(e.to_string()))?;
 
                 let mut entry_bytes = 0u64;
                 handle.block_on(async {
                     for object_id in &entry.chunk_object_ids {
                         let id = parse_object_id(object_id)?;
-                        let obj = shared.object(&id).await.map_err(|e| SiaClientError::Sdk(e.to_string()))?;
-                        let reader = shared.download(&obj, dl_opts(0)).map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+                        let obj = shared
+                            .object(&id)
+                            .await
+                            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+                        let reader = shared
+                            .download(&obj, dl_opts(0))
+                            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
                         let mut reader = std::pin::pin!(reader);
                         let mut buf = vec![0u8; 256 * 1024];
                         loop {
@@ -203,7 +232,8 @@ where
                             if n == 0 {
                                 break;
                             }
-                            zip.write_all(&buf[..n]).map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                            zip.write_all(&buf[..n])
+                                .map_err(|e| SiaClientError::Zip(e.to_string()))?;
                             entry_bytes += n as u64;
                             downloaded += n as u64;
                             if throttle.tick(false) {
@@ -215,7 +245,8 @@ where
                 })?;
                 if entry_bytes != entry.total_size {
                     return Err(SiaClientError::Integrity(format!(
-                        "{}: в ZIP попало {entry_bytes} байт из {}", entry.rel_path, entry.total_size
+                        "{}: в ZIP попало {entry_bytes} байт из {}",
+                        entry.rel_path, entry.total_size
                     )));
                 }
             }
@@ -224,7 +255,8 @@ where
 
         match result {
             Ok(()) => {
-                zip.finish().map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                zip.finish()
+                    .map_err(|e| SiaClientError::Zip(e.to_string()))?;
                 on_progress(downloaded, total_bytes);
                 Ok(())
             }
