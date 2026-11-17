@@ -18,4 +18,3 @@ apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
 # Отсебятина
 .env
 /.srcBuilders
-package-lock.json
