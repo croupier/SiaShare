@@ -18,6 +18,12 @@
   let validDays = 7;
 
   // --- Прогресс активной сессии ---
+  interface SessionInfo {
+    id: string; name: string; status: string; created_at: number;
+    last_error: string | null; seed_hex: string | null;
+    total: number; uploaded: number; failed: number;
+  }
+
   let activeSessionId: string | null = null;
   let totalChunks = 0;
   let uploadedChunks = 0;
@@ -33,6 +39,29 @@
   $: percent = totalChunks > 0
     ? Math.min(100, Math.round(((uploadedChunks + inflightSum) / totalChunks) * 100))
     : 0;
+
+  function hexToBytes(hex: string): number[] {
+    return Array.from(hex.match(/.{2}/g) ?? [], (b) => parseInt(b, 16));
+  }
+
+  // После перезапуска воркеры продолжают загрузку сами, но UI должен снова
+  // показывать сессию. Берем старейшую незавершенную (воркеры разбирают в том
+  // же порядке), иначе — последнюю сессию (завершенную/проваленную).
+  async function restoreSession() {
+    const sessions = await invoke<SessionInfo[]>('list_sessions');
+    const unfinished = sessions.filter((s) => s.status === 'uploading' || s.status === 'finalizing');
+    const s = unfinished.length ? unfinished[unfinished.length - 1] : sessions[0];
+    if (!s) return;
+    activeSessionId = s.id;
+    sessionName = s.name;
+    totalChunks = s.total; uploadedChunks = s.uploaded; failedChunks = s.failed;
+    inflight = new Map();
+    lastChunkError = '';
+    uploadError = s.status === 'failed' ? (s.last_error ?? 'Раздача не удалась') : '';
+    revoked = s.status === 'revoked';
+    completedKeyBytes = (s.status === 'completed' || s.status === 'revoked') && s.seed_hex
+      ? hexToBytes(s.seed_hex) : null;
+  }
 
   onMount(async () => {
     await listen<string>('auth-url', (e) => { authUrl = e.payload; });
@@ -72,13 +101,14 @@
 
     // Автовход по ключу из системного keychain
     isConnected = await invoke<boolean>('check_saved_auth');
+    if (isConnected) await restoreSession();
   });
 
   function connect(newAccount: boolean) {
     authError = ''; authUrl = ''; authWaiting = true;
     // invoke висит до одобрения в браузере — не await'им, UI живет на событиях
     invoke('connect_sia', { seedPhrase: newAccount ? null : seedPhrase.trim() || null })
-      .then(() => { isConnected = true; })
+      .then(async () => { isConnected = true; await restoreSession(); })
       .catch((e) => { authError = String(e); })
       .finally(() => { authWaiting = false; });
   }

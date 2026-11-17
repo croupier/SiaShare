@@ -25,6 +25,19 @@ pub struct PendingChunkTask {
     pub attempts: u32,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct SessionInfo {
+    pub id: String,
+    pub name: String,
+    pub status: String,
+    pub created_at: i64,
+    pub last_error: Option<String>,
+    pub seed_hex: Option<String>,
+    pub total: i64,
+    pub uploaded: i64,
+    pub failed: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FinalizeTask {
     pub session_id: String,
@@ -128,12 +141,15 @@ impl Database {
         Ok(session_id)
     }
 
-    /// Атомарно забирает следующий ожидающий чанк и переводит его в 'uploading',
-    /// сразу увеличивая счетчик попыток (переживает даже kill -9 посреди загрузки).
-    pub fn claim_next_pending_chunk(&self) -> Result<Option<PendingChunkTask>> {
+    /// Атомарно забирает пачку ожидающих чанков (старейшая сессия первой) и
+    /// переводит их в 'uploading', сразу увеличивая счетчик попыток (переживает
+    /// даже kill -9 посреди загрузки). Мелкие чанки набираются до
+    /// max_logical_bytes, чтобы упаковать их в один слаб; чанк больше лимита
+    /// уходит одиночной пачкой.
+    pub fn claim_next_pending_batch(&self, max_logical_bytes: u64) -> Result<Vec<PendingChunkTask>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
-        let task = {
+        let candidates: Vec<PendingChunkTask> = {
             let mut stmt = tx.prepare(
                 "SELECT c.file_id, f.session_id, f.local_path, f.rel_path, f.total_size,
                         f.total_chunks, f.chunk_size, c.chunk_index, c.offset_bytes, c.length_bytes, c.attempts
@@ -141,35 +157,43 @@ impl Database {
                  JOIN upload_files f ON c.file_id=f.id
                  JOIN upload_sessions s ON f.session_id=s.id
                  WHERE c.status='pending' AND s.status='uploading'
-                 ORDER BY s.created_at ASC, f.id ASC, c.chunk_index ASC LIMIT 1",
+                 ORDER BY s.created_at ASC, f.id ASC, c.chunk_index ASC LIMIT 1024",
             )?;
             let mut rows = stmt.query([])?;
-            rows.next()?
-                .map(|row| -> Result<PendingChunkTask> {
-                    Ok(PendingChunkTask {
-                        file_id: row.get(0)?,
-                        session_id: row.get(1)?,
-                        local_path: row.get(2)?,
-                        rel_path: row.get(3)?,
-                        total_file_size: row.get::<_, i64>(4)? as u64,
-                        total_chunks: row.get(5)?,
-                        chunk_size: row.get::<_, i64>(6)? as u64,
-                        chunk_index: row.get(7)?,
-                        offset_bytes: row.get::<_, i64>(8)? as u64,
-                        length_bytes: row.get::<_, i64>(9)? as u64,
-                        attempts: row.get::<_, u32>(10)? + 1,
-                    })
-                })
-                .transpose()?
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                out.push(PendingChunkTask {
+                    file_id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    local_path: row.get(2)?,
+                    rel_path: row.get(3)?,
+                    total_file_size: row.get::<_, i64>(4)? as u64,
+                    total_chunks: row.get(5)?,
+                    chunk_size: row.get::<_, i64>(6)? as u64,
+                    chunk_index: row.get(7)?,
+                    offset_bytes: row.get::<_, i64>(8)? as u64,
+                    length_bytes: row.get::<_, i64>(9)? as u64,
+                    attempts: row.get::<_, u32>(10)? + 1,
+                });
+            }
+            out
         };
-        if let Some(ref t) = task {
+        let mut batch = Vec::new();
+        let mut total = 0u64;
+        for t in candidates {
+            if !batch.is_empty() && total + t.length_bytes > max_logical_bytes { break; }
+            total += t.length_bytes;
+            batch.push(t);
+            if total >= max_logical_bytes { break; }
+        }
+        for t in &batch {
             tx.execute(
                 "UPDATE upload_chunks SET status='uploading', attempts=attempts+1 WHERE file_id=?1 AND chunk_index=?2",
                 params![t.file_id, t.chunk_index],
             )?;
         }
         tx.commit()?;
-        Ok(task)
+        Ok(batch)
     }
 
     /// Фиксирует успешную загрузку. Возвращает ПРЕЖНИЙ id объекта, если он был
@@ -222,6 +246,32 @@ impl Database {
             params![session_id],
             |r| Ok((r.get(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0), r.get::<_, Option<i64>>(2)?.unwrap_or(0))),
         )
+    }
+
+    /// Все сессии с прогрессом — для восстановления UI после перезапуска.
+    pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT s.id, s.name, s.status, s.created_at, s.last_error, s.sharing_key_seed,
+                    COUNT(c.chunk_index), COALESCE(SUM(c.status='uploaded'),0), COALESCE(SUM(c.status='failed'),0)
+             FROM upload_sessions s
+             LEFT JOIN upload_files f ON f.session_id=s.id
+             LEFT JOIN upload_chunks c ON c.file_id=f.id
+             GROUP BY s.id
+             ORDER BY s.created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |r| Ok(SessionInfo {
+            id: r.get(0)?,
+            name: r.get(1)?,
+            status: r.get(2)?,
+            created_at: r.get(3)?,
+            last_error: r.get(4)?,
+            seed_hex: r.get(5)?,
+            total: r.get(6)?,
+            uploaded: r.get(7)?,
+            failed: r.get(8)?,
+        }))?;
+        rows.collect()
     }
 
     /// Сессии, еще формально в 'uploading' — кандидаты на проверку готовности.
@@ -321,19 +371,32 @@ mod tests {
         let files = vec![("C:\\big.iso".into(), "big.iso".into(), 600 * 1024 * 1024u64)];
         let sid = db.create_session("Test", &files, 999999999).unwrap();
 
-        let c0 = db.claim_next_pending_chunk().unwrap().unwrap();
+        let c0 = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap();
+        assert_eq!(c0.len(), 1); // чанк 256 МиБ больше лимита паковки — одиночная пачка
+        let c0 = &c0[0];
         assert_eq!(c0.chunk_index, 0);
         assert_eq!(c0.length_bytes, DEFAULT_CHUNK_SIZE);
         assert_eq!(c0.attempts, 1);
 
         // Имитируем перезапуск программы при зависшем чанке c0
         let db2 = Database::init(&db_path).unwrap();
-        let c0_again = db2.claim_next_pending_chunk().unwrap().unwrap();
-        assert_eq!(c0_again.chunk_index, 0);
-        assert_eq!(c0_again.attempts, 2);
+        let c0_again = db2.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap();
+        assert_eq!(c0_again[0].chunk_index, 0);
+        assert_eq!(c0_again[0].attempts, 2);
 
-        db2.mark_chunk_uploaded(&c0_again.file_id, 0, &"aa".repeat(32)).unwrap();
+        db2.mark_chunk_uploaded(&c0_again[0].file_id, 0, &"aa".repeat(32)).unwrap();
         assert!(!db2.try_begin_finalize(&sid).unwrap()); // еще 2 чанка
+    }
+
+    #[test]
+    fn test_batch_packs_small_chunks() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        let files: Vec<(String, String, u64)> = (0..5).map(|i| (format!("p{i}"), format!("f{i}"), 1000)).collect();
+        db.create_session("S", &files, 0).unwrap();
+        let batch = db.claim_next_pending_batch(40 * 1024 * 1024).unwrap();
+        assert_eq!(batch.len(), 5); // все мелкие чанки — в одной пачке (один слаб)
+        assert!(db.claim_next_pending_batch(40 * 1024 * 1024).unwrap().is_empty());
     }
 
     #[test]
@@ -341,7 +404,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let db = Database::init(&dir.path().join("t.db")).unwrap();
         let sid = db.create_session("S", &[("p".into(), "f.bin".into(), 10)], 123).unwrap();
-        let t = db.claim_next_pending_chunk().unwrap().unwrap();
+        let t = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap().remove(0);
         db.mark_chunk_uploaded(&t.file_id, 0, &"bb".repeat(32)).unwrap();
         assert!(db.try_begin_finalize(&sid).unwrap());
         assert!(!db.try_begin_finalize(&sid).unwrap()); // повторно — уже finalizing
@@ -356,17 +419,32 @@ mod tests {
     }
 
     #[test]
+    fn test_list_sessions() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        let sid = db.create_session("S", &[("p".into(), "f".into(), 10)], 0).unwrap();
+        let t = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap().remove(0);
+        db.mark_chunk_uploaded(&t.file_id, 0, &"bb".repeat(32)).unwrap();
+        let list = db.list_sessions().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, sid);
+        assert_eq!(list[0].status, "uploading");
+        assert_eq!((list[0].total, list[0].uploaded, list[0].failed), (1, 1, 0));
+        assert!(list[0].seed_hex.is_none());
+    }
+
+    #[test]
     fn test_failed_after_max_attempts() {
         let dir = tempdir().unwrap();
         let db = Database::init(&dir.path().join("t.db")).unwrap();
         let sid = db.create_session("S", &[("p".into(), "f".into(), 10)], 0).unwrap();
         for i in 1..=3 {
-            let t = db.claim_next_pending_chunk().unwrap().unwrap();
+            let t = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap().remove(0);
             assert_eq!(t.attempts, i);
             let failed = db.record_chunk_error(&t.file_id, 0, "net", 3).unwrap();
             assert_eq!(failed, i == 3);
         }
-        assert!(db.claim_next_pending_chunk().unwrap().is_none());
+        assert!(db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap().is_empty());
         assert!(!db.try_begin_finalize(&sid).unwrap());
     }
 }

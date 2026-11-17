@@ -25,11 +25,12 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Цель | Как решено | Где |
 |---|---|---|
 | Обмен без своего сервера | Официальный Rust SDK `sia_storage` 0.13 + хостед-индексатор `https://sia.storage` | `sia_client.rs` |
-| Портал не видит содержимое | SDK шифрует данные и метаданные на клиенте до отправки | `upload_chunk` |
+| Портал не видит содержимое | SDK шифрует данные и метаданные на клиенте до отправки | `upload_packed_chunks` |
 | Получателю не нужен аккаунт | `SharingKey` вместо `AppKey`; `SharedSdk::connect(url, seed)` | `connect_shared` |
 | Ключ не утекает в сеть | Ключ — в имени файла, не в URL и не в теле запроса. URL-схемы и deep-link нет намеренно | `crypto.rs` |
 | Опциональный пароль | Argon2id(19456, t=2, p=1) → AES-256-GCM; блоб `[salt16][nonce12][ct+tag16]`; префикс `p1_` | `crypto.rs` |
 | Загрузка 10+ ГБ переживает перезапуск | Чанки 256 МиБ + немедленный `pin_object` + очередь SQLite + сброс `uploading→pending` при старте | `db.rs`, `worker.rs` |
+| Мелкие файлы не жгут трафик | PackedUpload: пачки чанков до 40 МиБ в общих слабах (одиночный объект стоил бы целого слаба ≈120 МиБ) | `upload_packed_chunks`, `claim_next_pending_batch` |
 | Большие файлы без раздувания RAM | `AsyncReadExt::take`, `max_buffered_slabs=2`, `max_buffered_chunks=64`, буфер 256 КиБ | `sia_client.rs`, `downloader.rs` |
 | Не выдать битый файл как «целый» | Непрерывность `chunk_idx` 0..n−1, сходимость размеров, `downloaded == total_size` перед rename | `group_summaries_into_tree`, `download_single_file` |
 | Докачка | Отправитель — по чанкам из БД; получатель — до байта через `DownloadOptions.offset` и `.part` | `downloader.rs` |
@@ -75,11 +76,12 @@ build.ps1 / build.sh             17    receiver → resources → установ
 
 Публичный API `sia-core` (строки — точки входа при навигации):
 
-- `sia_client`: `DEFAULT_INDEXER_URL`:13, `DEFAULT_CHUNK_SIZE`:14, `APP_META`:20,
-  `SiaClientError`:30, `parse_object_id`:56, `connect_with_app_key`:63,
-  `begin_connection`:74, `finish_connection`:86, `ensure_capacity`:114,
-  `upload_chunk`:133, `share_session_objects`:170, `revoke_share`:194,
-  `connect_shared`:201, `fetch_shared_tree`:210, `group_summaries_into_tree`:228
+- `sia_client`: `DEFAULT_INDEXER_URL`:12, `DEFAULT_CHUNK_SIZE`:13, `APP_META`:19,
+  `SiaClientError`:29, `parse_object_id`:55, `connect_with_app_key`:62,
+  `begin_connection`:73, `finish_connection`:85, `ensure_capacity`:113,
+  `ChunkUploadSpec`:130, `upload_packed_chunks`:142, `share_session_objects`:178,
+  `revoke_share`:202, `connect_shared`:209, `fetch_shared_tree`:218,
+  `group_summaries_into_tree`:236
 - `downloader`: `calculate_resume_chunk`:20, `download_single_file`:62, `download_as_zip`:159
 - `crypto`: `CryptoError`:12, `ExtractedKey`:27, `build_receiver_filename`:40,
   `extract_key_from_path`:66, `parse_payload`:86, `decrypt_with_password`:123

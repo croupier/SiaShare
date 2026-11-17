@@ -198,6 +198,12 @@ pub async fn get_session_progress(session_id: String, state: State<'_, UploaderS
     state.db.session_chunk_counts(&session_id).map_err(|e| e.to_string())
 }
 
+/// Список сессий (новые первыми) — UI восстанавливает активную раздачу после перезапуска.
+#[tauri::command]
+pub async fn list_sessions(state: State<'_, UploaderState>) -> Result<Vec<crate::db::SessionInfo>, String> {
+    state.db.list_sessions().map_err(|e| e.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

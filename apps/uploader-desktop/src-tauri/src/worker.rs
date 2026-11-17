@@ -1,9 +1,8 @@
 use crate::db::Database;
 use sia_core::models::ChunkMetadata;
-use sia_core::sia_client::{parse_object_id, share_session_objects, upload_chunk};
-use sia_storage::{Sdk, UploadOptions};
-use std::collections::HashMap;
-use std::path::Path;
+use sia_core::sia_client::{parse_object_id, share_session_objects, upload_packed_chunks, ChunkUploadSpec};
+use sia_storage::{PackedUploadOptions, Sdk};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -25,6 +24,8 @@ pub fn start_upload_workers(app: AppHandle, db: Database, concurrency: usize) ->
     let (sdk_tx, sdk_rx) = watch::channel::<Option<Arc<Sdk>>>(None);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
+    // Мелкие чанки пакуются в один слаб: лимит = полезные данные слаба (40 МиБ)
+    let batch_cap = PackedUploadOptions::default().optimal_data_size() as u64;
     for _ in 0..concurrency {
         let (app, db, sema, mut rx) = (app.clone(), db.clone(), semaphore.clone(), sdk_rx.clone());
         tauri::async_runtime::spawn(async move {
@@ -35,30 +36,41 @@ pub fn start_upload_workers(app: AppHandle, db: Database, concurrency: usize) ->
                 let Some(sdk) = sdk else { let _ = rx.changed().await; continue };
 
                 let permit = sema.clone().acquire_owned().await.unwrap();
-                let task = match db.claim_next_pending_chunk() {
-                    Ok(Some(t)) => t,
+                let tasks = match db.claim_next_pending_batch(batch_cap) {
+                    Ok(t) if !t.is_empty() => t,
                     _ => { drop(permit); tokio::time::sleep(Duration::from_secs(1)).await; continue }
                 };
                 let (app, db, sdk) = (app.clone(), db.clone(), sdk.clone());
                 tauri::async_runtime::spawn(async move {
                     let _permit = permit; // освободит слот при выходе
-                    let meta = ChunkMetadata {
-                        rel_path: task.rel_path.clone(),
-                        chunk_idx: task.chunk_index,
-                        total_chunks: task.total_chunks,
-                        total_file_size: task.total_file_size,
-                        chunk_size: task.chunk_size,
-                    };
+                    let specs: Vec<ChunkUploadSpec> = tasks.iter().map(|t| ChunkUploadSpec {
+                        local_path: t.local_path.clone(),
+                        offset_bytes: t.offset_bytes,
+                        length_bytes: t.length_bytes,
+                        meta: ChunkMetadata {
+                            rel_path: t.rel_path.clone(),
+                            chunk_idx: t.chunk_index,
+                            total_chunks: t.total_chunks,
+                            total_file_size: t.total_file_size,
+                            chunk_size: t.chunk_size,
+                        },
+                    }).collect();
 
-                    // Прогресс по шардам: shard_size — байты С избыточностью,
-                    // поэтому делим на ожидаемый encoded-размер чанка (~3x при 10+20)
-                    let opts = UploadOptions::default();
-                    let ratio = opts.slab_size() as f64 / opts.optimal_data_size() as f64;
-                    let expected_encoded = (task.length_bytes as f64 * ratio).max(1.0);
+                    // Прогресс по шардам: shard_size — байты С избыточностью.
+                    // Ожидаемый encoded-размер пачки = число слабов × полный слаб
+                    // (неполные слабы паддятся до полного размера).
+                    let opts = PackedUploadOptions::default();
+                    let logical: u64 = tasks.iter().map(|t| t.length_bytes).sum();
+                    let slabs = ((logical as f64 / opts.optimal_data_size() as f64).ceil() as u64).max(1);
+                    let expected_encoded = (slabs * opts.slab_size() as u64) as f64;
                     let sent = Arc::new(AtomicU64::new(0));
                     let last_ms = Arc::new(AtomicU64::new(0));
                     let start = Instant::now();
-                    let (app_cb, sid, fid, cidx) = (app.clone(), task.session_id.clone(), task.file_id.clone(), task.chunk_index);
+                    // Одна доля на всю пачку, рассылаемая по всем ее чанкам:
+                    // UI суммирует доли чанков — агрегированный прогресс сходится
+                    let targets: Vec<(String, String, u32)> = tasks.iter()
+                        .map(|t| (t.session_id.clone(), t.file_id.clone(), t.chunk_index)).collect();
+                    let (app_cb, targets_cb) = (app.clone(), targets.clone());
                     let (sent_cb, last_cb) = (sent.clone(), last_ms.clone());
                     let on_shard = move |p: sia_storage::ShardProgress| {
                         let total = sent_cb.fetch_add(p.shard_size as u64, Ordering::Relaxed) + p.shard_size as u64;
@@ -68,46 +80,57 @@ pub fn start_upload_workers(app: AppHandle, db: Database, concurrency: usize) ->
                         if now.saturating_sub(prev) >= 250
                             && last_cb.compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed).is_ok()
                         {
-                            let _ = app_cb.emit("chunk-progress", ChunkProgress {
-                                session_id: sid.clone(), file_id: fid.clone(), chunk_index: cidx,
-                                fraction: (total as f64 / expected_encoded).min(1.0),
-                            });
+                            let fraction = (total as f64 / expected_encoded).min(1.0);
+                            for (sid, fid, cidx) in &targets_cb {
+                                let _ = app_cb.emit("chunk-progress", ChunkProgress {
+                                    session_id: sid.clone(), file_id: fid.clone(), chunk_index: *cidx, fraction,
+                                });
+                            }
                         }
                     };
 
-                    match upload_chunk(&sdk, Path::new(&task.local_path), task.offset_bytes, task.length_bytes, &meta, on_shard).await {
-                        Ok(obj) => {
-                            let id_hex = obj.id().to_string();
-                            match db.mark_chunk_uploaded(&task.file_id, task.chunk_index, &id_hex) {
-                                Ok(old_id) => {
-                                    // Чистим сироту от прошлой неудачной попытки: слабы
-                                    // пиннятся уже во время upload, без удаления текла бы квота
-                                    if let Some(old) = old_id {
-                                        if let Ok(old_id) = parse_object_id(&old) {
-                                            let _ = sdk.delete_object(&old_id).await; // best-effort
+                    match upload_packed_chunks(&sdk, &specs, on_shard).await {
+                        Ok(objects) => {
+                            for (task, obj) in tasks.iter().zip(&objects) {
+                                let id_hex = obj.id().to_string();
+                                match db.mark_chunk_uploaded(&task.file_id, task.chunk_index, &id_hex) {
+                                    Ok(old_id) => {
+                                        // Чистим сироту от прошлой неудачной попытки: слабы
+                                        // пиннятся уже во время upload, без удаления текла бы квота
+                                        if let Some(old) = old_id {
+                                            if let Ok(old_id) = parse_object_id(&old) {
+                                                let _ = sdk.delete_object(&old_id).await; // best-effort
+                                            }
                                         }
                                     }
-                                    let _ = app.emit("chunk-uploaded", task.session_id.clone());
-                                    if let Ok((total, uploaded, failed)) = db.session_chunk_counts(&task.session_id) {
-                                        let _ = app.emit("session-progress", SessionProgress {
-                                            session_id: task.session_id.clone(), uploaded, total, failed,
-                                        });
-                                    }
+                                    Err(e) => eprintln!("БД: не удалось отметить чанк: {e}"),
                                 }
-                                Err(e) => eprintln!("БД: не удалось отметить чанк: {e}"),
+                            }
+                            let sessions: HashSet<String> = tasks.iter().map(|t| t.session_id.clone()).collect();
+                            for sid in sessions {
+                                let _ = app.emit("chunk-uploaded", sid.clone());
+                                if let Ok((total, uploaded, failed)) = db.session_chunk_counts(&sid) {
+                                    let _ = app.emit("session-progress", SessionProgress {
+                                        session_id: sid, uploaded, total, failed,
+                                    });
+                                }
                             }
                         }
                         Err(err) => {
-                            // Экспоненциальный backoff с потолком; после MAX_CHUNK_ATTEMPTS — failed
-                            let delay = Duration::from_secs((5u64 * 2u64.saturating_pow(task.attempts - 1)).min(300));
+                            // Экспоненциальный backoff с потолком; после MAX_CHUNK_ATTEMPTS — failed.
+                            // Пачка ретраится целиком: объекты неразделимы до finalize.
+                            let attempts = tasks.iter().map(|t| t.attempts).max().unwrap_or(1);
+                            let delay = Duration::from_secs((5u64 * 2u64.saturating_pow(attempts - 1)).min(300));
                             tokio::time::sleep(delay).await;
-                            let failed = db.record_chunk_error(&task.file_id, task.chunk_index, &err.to_string(), MAX_CHUNK_ATTEMPTS).unwrap_or(false);
-                            let _ = app.emit("chunk-error", serde_json::json!({
-                                "session_id": task.session_id, "chunk_index": task.chunk_index,
-                                "error": err.to_string(), "failed": failed,
-                            }));
-                            if failed {
-                                let _ = app.emit("session-failed", (task.session_id.clone(), err.to_string()));
+                            for task in &tasks {
+                                let failed = db.record_chunk_error(&task.file_id, task.chunk_index, &err.to_string(), MAX_CHUNK_ATTEMPTS).unwrap_or(false);
+                                let _ = app.emit("chunk-error", serde_json::json!({
+                                    "session_id": task.session_id, "chunk_index": task.chunk_index,
+                                    "error": err.to_string(), "failed": failed,
+                                }));
+                                if failed {
+                                    let _ = app.emit("session-failed", (task.session_id.clone(), err.to_string()));
+                                }
                             }
                         }
                     }

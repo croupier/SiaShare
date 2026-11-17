@@ -5,8 +5,8 @@ mod db;
 mod worker;
 
 use commands::{
-    check_saved_auth, connect_sia, generate_share_zip, get_session_progress, revoke_session,
-    start_upload_session, UploaderState,
+    check_saved_auth, connect_sia, generate_share_zip, get_session_progress, list_sessions,
+    revoke_session, start_upload_session, UploaderState,
 };
 use db::Database;
 use tauri::Manager;
@@ -38,7 +38,8 @@ fn main() {
             start_upload_session,
             generate_share_zip,
             revoke_session,
-            get_session_progress
+            get_session_progress,
+            list_sessions
         ])
         .run(tauri::generate_context!())
         .expect("Ошибка запуска uploader-desktop");

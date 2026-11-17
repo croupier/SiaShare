@@ -1,11 +1,10 @@
 use crate::models::{sanitize_rel_path, ChunkMetadata, SharedFileEntry};
 use chrono::{DateTime, Utc};
 use sia_storage::{
-    app_id, AppKey, AppMetadata, Builder, Hash256, Object, RequestingApprovalState, Sdk, SharedSdk,
-    SharingKey, SharingKeyOptions, ShardProgress, UploadOptions,
+    app_id, AppKey, AppMetadata, Builder, Hash256, Object, PackedUploadOptions,
+    RequestingApprovalState, Sdk, SharedSdk, SharingKey, SharingKeyOptions, ShardProgress,
 };
 use std::collections::HashMap;
-use std::path::Path;
 use thiserror::Error;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -127,40 +126,49 @@ pub async fn ensure_capacity(sdk: &Sdk, planned_bytes: u64) -> Result<(), SiaCli
     Ok(())
 }
 
-/// Потоково загружает срез файла (чанк) и сразу закрепляет его.
-/// Колбэк on_shard вызывается SDK на каждый отправленный шард; вызывающий
-/// сам троттлит события для UI.
-pub async fn upload_chunk<F>(
+/// Срез файла для пакетной загрузки вместе с метаданными получателя.
+pub struct ChunkUploadSpec {
+    pub local_path: String,
+    pub offset_bytes: u64,
+    pub length_bytes: u64,
+    pub meta: ChunkMetadata,
+}
+
+/// Загружает пачку чанков отдельными объектами, но в ОБЩИХ слабах (PackedUpload).
+/// Одиночная загрузка мелкого объекта стоила бы целого слаба (30 шардов × 4 МиБ
+/// ≈ 120 МиБ трафика): SDK паддит неполные слабы до полного размера.
+/// Возвращает объекты в порядке `chunks`; метаданные проставляются после
+/// finalize — id объекта зависит только от слабов. Каждый объект пиннится сразу.
+pub async fn upload_packed_chunks<F>(
     sdk: &Sdk,
-    local_path: &Path,
-    offset: u64,
-    length: u64,
-    meta: &ChunkMetadata,
+    chunks: &[ChunkUploadSpec],
     on_shard: F,
-) -> Result<Object, SiaClientError>
+) -> Result<Vec<Object>, SiaClientError>
 where
     F: Fn(ShardProgress) + Send + Sync + 'static,
 {
-    let mut file = File::open(local_path).await?;
-    file.seek(SeekFrom::Start(offset)).await?;
-    // AsyncReadExt::take читает строго `length` байт без загрузки чанка в ОЗУ
-    let chunk_stream = file.take(length);
-
-    // Метаданные — публичное поле Object; SDK шифрует их вместе с объектом.
-    let obj = Object::new(Some(serde_json::to_vec(meta)?));
-
-    let opts = UploadOptions {
-        // По умолчанию SDK буферизует до 10% ОЗУ (или 1 ГБ) НА КАЖДУЮ загрузку;
-        // при 3 параллельных чанках это гигабайты. 2 слаба ~ 240 МиБ на воркер.
+    let opts = PackedUploadOptions {
+        // По умолчанию SDK буферизует до 10% ОЗУ НА КАЖДУЮ загрузку;
+        // при 3 параллельных пачках это гигабайты. 2 слаба ~ 240 МиБ на воркер.
         max_buffered_slabs: Some(2),
-        ..UploadOptions::default()
+        shard_uploaded: Some(std::sync::Arc::new(on_shard)),
+        ..PackedUploadOptions::default()
+    };
+    let mut packed = sdk.upload_packed(opts).map_err(sdk_err)?;
+    for c in chunks {
+        let mut file = File::open(&c.local_path).await?;
+        file.seek(SeekFrom::Start(c.offset_bytes)).await?;
+        // AsyncReadExt::take читает строго `length_bytes` без загрузки чанка в ОЗУ
+        packed.add(file.take(c.length_bytes)).await.map_err(sdk_err)?;
     }
-    .on_shard_uploaded(on_shard);
-
-    let uploaded = sdk.upload(obj, chunk_stream, opts).await.map_err(sdk_err)?;
-    // Немедленный pin: индексатор берет чанк под защиту и ремонтирует его.
-    sdk.pin_object(&uploaded).await.map_err(sdk_err)?;
-    Ok(uploaded)
+    let mut objects = packed.finalize().await.map_err(sdk_err)?;
+    for (obj, c) in objects.iter_mut().zip(chunks) {
+        obj.metadata = serde_json::to_vec(&c.meta)?;
+    }
+    for obj in &objects {
+        sdk.pin_object(obj).await.map_err(sdk_err)?;
+    }
+    Ok(objects)
 }
 
 /// Создает SharingKey (или переиспользует сохраненный seed при повторе) и
