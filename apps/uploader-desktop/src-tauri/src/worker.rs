@@ -33,6 +33,16 @@ fn compute_expires_at(
     }
 }
 
+/// Backoff финализации: 10·2^(n-1) секунд, потолок 300 с. Чистая функция ради
+/// теста; расписание повторов хранится per-session и не блокирует другие сессии.
+fn finalize_retry_delay(attempt: u32) -> Duration {
+    Duration::from_secs(
+        10u64
+            .saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)))
+            .min(300),
+    )
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ChunkProgress {
     session_id: String,
@@ -100,6 +110,8 @@ pub fn start_upload_workers(
                                 total_chunks: t.total_chunks,
                                 total_file_size: t.total_file_size,
                                 chunk_size: t.chunk_size,
+                                // blake3 посчитается при чтении чанка в upload_packed_chunks
+                                blake3: None,
                             },
                         })
                         .collect();
@@ -247,7 +259,10 @@ pub fn start_upload_workers(
     {
         let (app, db, mut rx) = (app.clone(), db.clone(), sdk_rx.clone());
         tauri::async_runtime::spawn(async move {
-            let mut attempts: HashMap<String, u32> = HashMap::new();
+            // На сессию: (номер попытки, момент следующей попытки). Backoff больше
+            // не тормозит весь цикл sleep'ом — зависшая сессия просто пропускается
+            // до своего next_at, остальные финализируются без задержки (head-of-line).
+            let mut retry: HashMap<String, (u32, Instant)> = HashMap::new();
             loop {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let Some(sdk) = rx.borrow_and_update().clone() else {
@@ -258,74 +273,72 @@ pub fn start_upload_workers(
                 for sid in db.uploading_session_ids().unwrap_or_default() {
                     let _ = db.try_begin_finalize(&sid);
                 }
-                let Ok(Some(task)) = db.next_finalizing_session() else {
+                let Ok(tasks) = db.finalizing_sessions() else {
                     continue;
                 };
-
-                let n = attempts.entry(task.session_id.clone()).or_insert(0);
-                *n += 1;
-                if *n > MAX_FINALIZE_ATTEMPTS {
-                    let _ = db.mark_session_failed(
-                        &task.session_id,
-                        "финализация: превышен лимит попыток",
-                    );
-                    let _ = app.emit(
-                        "session-failed",
-                        (
-                            task.session_id.clone(),
-                            "финализация не удалась".to_string(),
-                        ),
-                    );
-                    attempts.remove(&task.session_id);
-                    continue;
-                }
-
-                let result = async {
-                    let ids: Vec<_> = db
-                        .session_object_ids(&task.session_id)
-                        .map_err(|e| e.to_string())?
-                        .iter()
-                        .map(|s| parse_object_id(s).map_err(|e| e.to_string()))
-                        .collect::<Result<_, _>>()?;
-                    // TTL отсчитывается от ФИНАЛИЗАЦИИ (см. compute_expires_at)
-                    let expires =
-                        compute_expires_at(task.ttl_seconds, task.expires_at, chrono::Utc::now())?;
-                    let existing = task
-                        .seed_hex
-                        .as_deref()
-                        .and_then(|h| hex::decode(h).ok())
-                        .and_then(|v| <[u8; 32]>::try_from(v).ok());
-                    let fresh = existing.is_none();
-                    let seed = share_session_objects(&sdk, &task.name, expires, &ids, existing)
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    // Seed сохраняем сразу: повтор не должен плодить новые ключи
-                    if fresh {
-                        db.save_session_seed(&task.session_id, &hex::encode(seed))
-                            .map_err(|e| e.to_string())?;
+                for task in tasks {
+                    let sid = task.session_id.clone();
+                    let now = Instant::now();
+                    let entry = retry.entry(sid.clone()).or_insert((0, now));
+                    if now < entry.1 {
+                        continue; // backoff ещё не истёк — не блокируем другие сессии
                     }
-                    Ok::<[u8; 32], String>(seed)
-                }
-                .await;
-
-                match result {
-                    Ok(seed) => {
-                        let _ = db.mark_session_completed(&task.session_id);
-                        // Освобождаем квоту от сирот неудачных попыток (индексатор
-                        // сам защищает недавно загруженные слабы от premature prune)
-                        let _ = sdk.prune_slabs(None).await;
+                    entry.0 += 1;
+                    let n = entry.0;
+                    if n > MAX_FINALIZE_ATTEMPTS {
+                        let _ = db.mark_session_failed(&sid, "финализация: превышен лимит попыток");
                         let _ = app.emit(
-                            "session-completed",
-                            (task.session_id.clone(), seed.to_vec()),
+                            "session-failed",
+                            (sid.clone(), "финализация не удалась".to_string()),
                         );
-                        attempts.remove(&task.session_id);
+                        retry.remove(&sid);
+                        continue;
                     }
-                    Err(e) => {
-                        eprintln!("Финализация {}: {e}", task.session_id);
-                        tokio::time::sleep(Duration::from_secs(
-                            (10 * 2u64.saturating_pow(*n - 1)).min(300),
-                        ))
-                        .await;
+
+                    let result = async {
+                        let ids: Vec<_> = db
+                            .session_object_ids(&sid)
+                            .map_err(|e| e.to_string())?
+                            .iter()
+                            .map(|s| parse_object_id(s).map_err(|e| e.to_string()))
+                            .collect::<Result<_, _>>()?;
+                        // TTL отсчитывается от ФИНАЛИЗАЦИИ (см. compute_expires_at)
+                        let expires = compute_expires_at(
+                            task.ttl_seconds,
+                            task.expires_at,
+                            chrono::Utc::now(),
+                        )?;
+                        let existing = task
+                            .seed_hex
+                            .as_deref()
+                            .and_then(|h| hex::decode(h).ok())
+                            .and_then(|v| <[u8; 32]>::try_from(v).ok());
+                        let fresh = existing.is_none();
+                        let seed = share_session_objects(&sdk, &task.name, expires, &ids, existing)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        // Seed сохраняем сразу: повтор не должен плодить новые ключи
+                        if fresh {
+                            db.save_session_seed(&sid, &hex::encode(seed))
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Ok::<[u8; 32], String>(seed)
+                    }
+                    .await;
+
+                    match result {
+                        Ok(seed) => {
+                            let _ = db.mark_session_completed(&sid);
+                            // Освобождаем квоту от сирот неудачных попыток (индексатор
+                            // сам защищает недавно загруженные слабы от premature prune)
+                            let _ = sdk.prune_slabs(None).await;
+                            let _ = app.emit("session-completed", (sid.clone(), seed.to_vec()));
+                            retry.remove(&sid);
+                        }
+                        Err(e) => {
+                            eprintln!("Финализация {sid}: {e}");
+                            retry.insert(sid, (n, Instant::now() + finalize_retry_delay(n)));
+                        }
                     }
                 }
             }
@@ -374,5 +387,17 @@ mod tests {
     #[test]
     fn test_ttl_overflow_is_error() {
         assert!(compute_expires_at(Some(i64::MAX), None, ts(1_000_000)).is_err());
+    }
+
+    #[test]
+    fn test_finalize_retry_backoff_caps_at_300() {
+        assert_eq!(finalize_retry_delay(1), Duration::from_secs(10));
+        assert_eq!(finalize_retry_delay(2), Duration::from_secs(20));
+        assert_eq!(finalize_retry_delay(5), Duration::from_secs(160));
+        // 10·2^5 = 320 → потолок 300; дальше не растёт и не переполняется
+        assert_eq!(finalize_retry_delay(6), Duration::from_secs(300));
+        assert_eq!(finalize_retry_delay(100), Duration::from_secs(300));
+        // attempt=0 не паникует (saturating_sub)
+        assert_eq!(finalize_retry_delay(0), Duration::from_secs(10));
     }
 }

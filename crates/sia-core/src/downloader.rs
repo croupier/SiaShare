@@ -36,6 +36,30 @@ fn expected_chunk_len(entry: &SharedFileEntry, idx: usize) -> u64 {
     }
 }
 
+/// Читает `len` байт файла с диска от `offset` и возвращает blake3 (hex).
+/// Побайтовое чтение блоками — без загрузки чанка в ОЗУ. Недочитанное (файл
+/// короче ожидаемого) = ошибка целостности, а не тихий успех. len=0 → blake3("").
+async fn hash_file_range(path: &Path, offset: u64, len: u64) -> Result<String, SiaClientError> {
+    let mut f = fs::File::open(path).await?;
+    f.seek(SeekFrom::Start(offset)).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(SiaClientError::Integrity(format!(
+                "{}: чанк короче ожидаемого при проверке blake3",
+                path.display()
+            )));
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 /// Fingerprint докачки: id первого чанка + полный размер. Хранится в sidecar
 /// `<имя>.part.id` рядом с .part. Совпадение означает, что .part принадлежит
 /// именно этому файлу раздачи, а не другому с тем же именем.
@@ -238,6 +262,20 @@ where
                 expected
             )));
         }
+        // blake3 содержимого (если отправитель прислал хэш): читаем ВЕСЬ чанк с
+        // диска и сверяем — это покрывает и докачанный префикс. Legacy-раздачи
+        // без хэша (None) пропускаем: для них остаются Merkle-пруфы SDK.
+        if let Some(expected_hex) = entry.chunk_blake3.get(idx).and_then(|o| o.as_deref()) {
+            out_file.flush().await?;
+            let actual =
+                hash_file_range(&part_path, idx as u64 * entry.chunk_size, expected).await?;
+            if actual != expected_hex {
+                return Err(SiaClientError::Integrity(format!(
+                    "{}: чанк {idx} не сошёлся по blake3 (ожидался {expected_hex}, получен {actual})",
+                    entry.rel_path
+                )));
+            }
+        }
     }
 
     // Финальная проверка РАЗМЕРА: без нее недостающий чанк превратился бы
@@ -303,7 +341,7 @@ where
 
                 let mut entry_bytes = 0u64;
                 handle.block_on(async {
-                    for object_id in &entry.chunk_object_ids {
+                    for (idx, object_id) in entry.chunk_object_ids.iter().enumerate() {
                         let id = parse_object_id(object_id)?;
                         let obj = shared
                             .object(&id)
@@ -314,6 +352,7 @@ where
                             .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
                         let mut reader = std::pin::pin!(reader);
                         let mut buf = vec![0u8; 256 * 1024];
+                        let mut hasher = blake3::Hasher::new();
                         loop {
                             if cancel.load(Ordering::Relaxed) {
                                 return Err(SiaClientError::Cancelled);
@@ -329,10 +368,23 @@ where
                             }
                             zip.write_all(&buf[..n])
                                 .map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                            hasher.update(&buf[..n]);
                             entry_bytes += n as u64;
                             downloaded += n as u64;
                             if throttle.tick(false) {
                                 on_progress(downloaded, total_bytes);
+                            }
+                        }
+                        // blake3 чанка поверх Merkle-пруфов; legacy None → пропускаем
+                        if let Some(expected_hex) =
+                            entry.chunk_blake3.get(idx).and_then(|o| o.as_deref())
+                        {
+                            let actual = hasher.finalize().to_hex().to_string();
+                            if actual != expected_hex {
+                                return Err(SiaClientError::Integrity(format!(
+                                    "{}: чанк {idx} не сошёлся по blake3 в ZIP",
+                                    entry.rel_path
+                                )));
                             }
                         }
                     }
@@ -386,6 +438,7 @@ mod tests {
             total_chunks: 2,
             chunk_size: 256,
             chunk_object_ids: vec!["x".into(), "y".into()],
+            chunk_blake3: vec![None, None],
         };
         assert_eq!(expected_chunk_len(&e, 0), 256);
         assert_eq!(expected_chunk_len(&e, 1), 244);
@@ -398,6 +451,7 @@ mod tests {
             total_chunks: 1,
             chunk_size: 256,
             chunk_object_ids: vec![first_id.into()],
+            chunk_blake3: vec![None],
         }
     }
 
@@ -419,5 +473,23 @@ mod tests {
         // битый формат
         assert!(!resume_is_trusted(Some("abc"), "abc", 500));
         assert!(!resume_is_trusted(Some("abc\nnotanumber"), "abc", 500));
+    }
+
+    #[tokio::test]
+    async fn test_hash_file_range_matches_blake3() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.bin");
+        fs::write(&p, b"hello world").await.unwrap();
+        // полный диапазон совпадает с эталонным blake3
+        let h = hash_file_range(&p, 0, 11).await.unwrap();
+        assert_eq!(h, blake3::hash(b"hello world").to_hex().to_string());
+        // offset + поддиапазон (имитация чанка не с начала файла)
+        let h2 = hash_file_range(&p, 6, 5).await.unwrap();
+        assert_eq!(h2, blake3::hash(b"world").to_hex().to_string());
+        // пустой чанк → blake3("")
+        let h0 = hash_file_range(&p, 0, 0).await.unwrap();
+        assert_eq!(h0, blake3::hash(b"").to_hex().to_string());
+        // файл короче запрошенного → ошибка целостности, не тихий успех
+        assert!(hash_file_range(&p, 0, 100).await.is_err());
     }
 }

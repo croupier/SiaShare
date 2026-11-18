@@ -8,7 +8,6 @@ use sia_core::validate::{validate_windows_paths, PathWarning};
 use sia_storage::Sdk;
 use std::collections::HashSet;
 use std::fs::{self, File};
-use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -270,10 +269,6 @@ pub async fn generate_share_zip(
             .map_err(|e| e.to_string())?;
         let mut template_file = File::open(&template_path)
             .map_err(|e| format!("Не удалось открыть шаблон {template_path:?}: {e}"))?;
-        let mut exe_bytes = Vec::new();
-        template_file
-            .read_to_end(&mut exe_bytes)
-            .map_err(|e| e.to_string())?;
         let zip_file = File::create(&output_zip_path).map_err(|e| e.to_string())?;
         let mut zip = ZipWriter::new(zip_file);
         let options = SimpleFileOptions::default()
@@ -281,7 +276,8 @@ pub async fn generate_share_zip(
             .unix_permissions(0o755); // исполняемый файл для Linux/macOS
         zip.start_file(&inner_exe_name, options)
             .map_err(|e| e.to_string())?;
-        zip.write_all(&exe_bytes).map_err(|e| e.to_string())?;
+        // Потоковое копирование шаблона в ZIP без загрузки всего exe в ОЗУ
+        std::io::copy(&mut template_file, &mut zip).map_err(|e| e.to_string())?;
         zip.finish().map_err(|e| e.to_string())?;
         Ok::<(), String>(())
     })

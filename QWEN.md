@@ -32,7 +32,7 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Загрузка 10+ ГБ переживает перезапуск | Чанки 256 МиБ + немедленный `pin_object` + очередь SQLite + сброс `uploading→pending` при старте | `db.rs`, `worker.rs` |
 | Мелкие файлы не жгут трафик | PackedUpload: пачки чанков до 40 МиБ в общих слабах (одиночный объект стоил бы целого слаба ≈120 МиБ) | `upload_packed_chunks`, `claim_next_pending_batch` |
 | Большие файлы без раздувания RAM | `AsyncReadExt::take`, `max_buffered_slabs=2`, `max_buffered_chunks=64`, буфер 256 КиБ | `sia_client.rs`, `downloader.rs` |
-| Не выдать битый файл как «целый» | Непрерывность `chunk_idx` 0..n−1, сходимость размеров, `downloaded == total_size` перед rename | `group_summaries_into_tree`, `download_single_file` |
+| Не выдать битый файл как «целый» | Непрерывность `chunk_idx` 0..n−1, сходимость размеров, `downloaded == total_size` перед rename + per-chunk blake3 | `group_summaries_into_tree`, `download_single_file` |
 | Докачка | Отправитель — по чанкам из БД; получатель — до байта через `DownloadOptions.offset` и `.part` | `downloader.rs` |
 | Отзыв доступа | `revoke_sharing_key`; выданные токены доживают ~5 минут | `revoke_share` |
 | Срок жизни не съедается загрузкой | TTL отсчитывается от финализации; `validDays=0` → `expires_at=None` (вечная шара) | `worker.rs`, `db.rs` |
@@ -43,9 +43,13 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Обход папок не глотает ошибки | Ошибки `WalkDir` → `Err` (не `filter_map(ok)`), обход в `spawn_blocking` | `collect_files_recursive` |
 | Автовход различает «нет ключа» и сбой | `keyring::NoEntry` → `Ok(false)`; прочие ошибки keychain/сети → `Err`; UI ловит + «Повторить автовход» | `check_saved_auth`, `App.svelte` |
 | Докачка не клеит чужой `.part` | Sidecar `.part.id` (id первого чанка + размер); не совпал/нет → заново | `downloader.rs` |
+| Сквозная целостность содержимого | blake3 чанка считается при чтении на загрузке (`HashingReader`, без лишнего прохода), хранится в метаданных; получатель сверяет чанк с диска. Legacy без хэша → пропуск (остаются Merkle-пруфы SDK) | `sia_client.rs`, `downloader.rs`, `models.rs` |
+| Финализация/пиннинг не по одному | `share_object`/`pin_object` параллельно через `buffer_unordered(4)`; SDK-методы `&self` без общего изменяемого состояния | `share_session_objects`, `upload_packed_chunks` |
+| Зависшая сессия не тормозит финализатор | Per-session расписание `(attempts, next_at)` вместо блокирующего sleep; остальные финализируются без задержки | `worker.rs`, `finalizing_sessions` |
+| Шаблон receiver не грузится в RAM | `generate_share_zip`: `io::copy` шаблона в `ZipWriter` на blocking-потоке | `commands.rs` |
 | AppKey не в plaintext | Системный keychain (`keyring` v3), запись `siashare-desktop` / `sia-app-key` | `commands.rs` |
 | Папки и ZIP >4 ГиБ | Синхронный `zip` с `large_file(true)` на `spawn_blocking`, мост async→sync через `Handle::block_on` | `download_as_zip` |
-| Малый переносимый receiver | Tauri v2 + Rust-ядро + тонкий Svelte; release: `opt-level="z"`, `lto`, `panic="abort"`, `strip` | корневой `Cargo.toml` |
+| Малый переносимый receiver | Tauri v2 + Rust-ядро + тонкий Svelte; release `opt-level=3` (скорость SDK), для receiver-micro override `"z"` (размер); `lto`, `panic="abort"`, `strip` | корневой `Cargo.toml` |
 | Прогресс без флуда и «заморозок» | Колбэки `ShardProgress` + троттлинг 250 мс (upload) / 200 мс (download) | `worker.rs`, `downloader.rs` |
 | Повторный вход не оставляет старый SDK | Единый источник правды — `watch::Sender<Option<Arc<Sdk>>>`; отдельного `Mutex` нет | `UploaderState` |
 
@@ -62,18 +66,18 @@ UI не знает про Sia и крипту. Вся сеть, файлы и к
 
 ```
 Cargo.toml                       workspace: 3 крейта, общие версии зависимостей
-crates/sia-core/src/             ядро без зависимости от Tauri (1510 строк)
-  sia_client.rs   434            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
-  downloader.rs   423            .part-докачка, ZIP64, отмена, троттлинг, .part.id
+crates/sia-core/src/             ядро без зависимости от Tauri (1700 строк)
+  sia_client.rs   518            SDK-обёртка: вход, квота, загрузка+blake3, шаринг, дерево
+  downloader.rs   495            .part-докачка, ZIP64, отмена, троттлинг, .part.id, blake3
   crypto.rs       304            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
-  models.rs        81            ChunkMetadata, SharedFileEntry, sanitize_rel_path
+  models.rs       115            ChunkMetadata, SharedFileEntry, sanitize_rel_path
   validate.rs     259            preflight-проверка имён на совместимость с Windows
   lib.rs            9            только pub mod
-apps/uploader-desktop/src-tauri/src/   (1535 строк)
-  db.rs           674            схема SQLite, claim/finalize, счётчики, тесты
-  commands.rs     411            9 Tauri-команд + обход папок + дедуп путей
-  worker.rs       363            пул воркеров + финализатор, compute_expires_at
-  main.rs          87            плагины, setup, manage
+apps/uploader-desktop/src-tauri/src/   (1627 строк)
+  db.rs           711            схема SQLite, claim/finalize, счётчики, тесты
+  commands.rs     424            9 Tauri-команд + обход папок + дедуп путей
+  worker.rs       403            пул воркеров + финализатор (per-session backoff), compute_expires_at
+  main.rs          89            плагины, setup, manage
 apps/uploader-desktop/src/App.svelte   352
 apps/receiver-micro/src-tauri/src/     (228 строк)
   commands.rs     193            6 Tauri-команд, гейт скачивания
@@ -85,17 +89,17 @@ build.ps1 / build.sh             17    receiver → resources → установ
 
 Публичный API `sia-core` (строки — точки входа при навигации):
 
-- `sia_client`: `DEFAULT_INDEXER_URL`:12, `DEFAULT_CHUNK_SIZE`:13, `APP_META`:19,
-  `SiaClientError`:29, `parse_object_id`:55, `connect_with_app_key`:62,
-  `begin_connection`:73, `finish_connection`:85, `ensure_capacity`:113,
-  `ChunkUploadSpec`:130, `upload_packed_chunks`:142, `share_session_objects`:178,
-  `revoke_share`:202, `connect_shared`:209, `fetch_shared_tree`:218,
-  `group_summaries_into_tree`:236
-- `downloader`: `calculate_resume_chunk`:20, `download_single_file`:62, `download_as_zip`:159
+- `sia_client`: `DEFAULT_INDEXER_URL`:16, `DEFAULT_CHUNK_SIZE`:17, `APP_META`:27,
+  `SiaClientError`:37, `parse_object_id`:63, `connect_with_app_key`:71,
+  `begin_connection`:82, `finish_connection`:94, `ensure_capacity`:127,
+  `ChunkUploadSpec`:144, `upload_packed_chunks`:184, `share_session_objects`:246,
+  `revoke_share`:281, `connect_shared`:290, `fetch_shared_tree`:301,
+  `group_summaries_into_tree`:322
+- `downloader`: `calculate_resume_chunk`:21, `download_single_file`:154, `download_as_zip`:306
 - `crypto`: `CryptoError`:12, `ExtractedKey`:27, `build_receiver_filename`:40,
   `extract_key_from_path`:66, `parse_payload`:86, `decrypt_with_password`:123
   (`encrypt_with_password` и `derive_key` — приватные)
-- `models`: `ChunkMetadata`:6, `SharedFileEntry`:21, `sanitize_rel_path`:37
+- `models`: `ChunkMetadata`:6, `SharedFileEntry`:26, `sanitize_rel_path`:47
 - `validate`: `PATH_LEN_WARN`=200, `COMPONENT_LEN_MAX`=255, `PathWarningKind`,
   `PathWarning`, `validate_windows_paths` (чистая функция + тесты)
 
@@ -168,8 +172,17 @@ COM1–9/LPT1–9/CONIN$/CONOUT$, точка/пробел в конце комп
 Fallback — `key.sia` рядом с бинарником (подъём до 4 уровней, для macOS `.app`).
 
 **ChunkMetadata** (JSON в `Object.metadata`, шифруется SDK):
-`rel_path, chunk_idx, total_chunks, total_file_size, chunk_size`.
+`rel_path, chunk_idx, total_chunks, total_file_size, chunk_size, blake3?`.
+`blake3` — hex 32-байтного хэша содержимого чанка; `#[serde(default)]`: старые
+раздачи без поля → `None` (проверка пропускается, остаются Merkle-пруфы SDK).
 `rel_path` — только прямые слеши, без `..`, `.`, пустых сегментов, `:` и `\`.
+
+**SharedFileEntry** (возврат `init_receiver`/`unlock_with_password`):
+`rel_path, total_size, total_chunks, chunk_size, chunk_object_ids, chunk_blake3`.
+`chunk_blake3: (string|null)[]` параллелен `chunk_object_ids` (тот же порядок по
+`chunk_idx`); `#[serde(default)]` → пустой массив у старого IPC. Хэши живут в
+Rust-состоянии получателя (`files: Mutex<Vec<SharedFileEntry>>`) и через UI не
+ходят — `download_one`/`download_selected_zip` принимают только `relPath`.
 
 **SQLite** (`storage/queue.db` в корне проекта у dev-сборки, иначе `%APPDATA%\com.siashare.uploader\queue.db`; WAL):
 - `upload_sessions(id,name,status,sharing_key_seed,last_error,expires_at,ttl_seconds,created_at)`
@@ -199,7 +212,9 @@ Fallback — `key.sia` рядом с бинарником (подъём до 4 �
 4. Файл не читается целиком в память.
 5. `.part` не переименовывается в итоговый файл без проверки размера; докачка
    доверяет `.part` только при совпадении sidecar `.part.id` (id первого чанка +
-   размер). Legacy `.part` без сайдкара недоверен — качается заново.
+   размер). Legacy `.part` без сайдкара недоверен — качается заново. Чанки с
+   blake3 в метаданных сверяются по содержимому после скачивания (несовпадение =
+   ошибка целостности, не тихий успех); legacy-чанки без хэша — только Merkle-пруфы SDK.
 6. Ошибки целостности не проглатываются (`filter_map(...ok())` запрещён в этих путях).
 7. Формат блоба версионирован (`p1_`); смена параметров KDF → новый префикс.
 8. Старый `S#…exe` должен открываться новой версией ядра.
@@ -266,6 +281,8 @@ cd apps\uploader-desktop; npm run tauri dev
 | `Blocking waiting for file lock` | rust-analyzer и ручной cargo дерутся за `target/`. В Zed: `cargo.targetDir: true` |
 | В release паника убивает процесс молча | `panic="abort"` + `strip=true`; `catch_unwind` не работает, только `Result` |
 | `.ps1` с кириллицей падает с `MissingEndParenthesis` | UTF-8 без BOM + CP1251: тире `—` превращается в «умную кавычку» и рвёт строку. Пересохранить с BOM или запускать `pwsh` |
+| `implementation of FnOnce is not general enough` | `buffer_unordered` + `async move`, заимствующий аргумент итератора (`&Object`/`&Hash256`) — HRTB. Решение: итерация по индексам `0..len`, срез привязать ссылкой (`let objs = objects.as_slice()`): аргумент замыкания owned `usize`, заимствование живёт во внешней области, Vec не перемещается |
+| Паника переполнения в backoff при большом n | `10 * 2u64.saturating_pow(n-1)`: pow насыщается до `u64::MAX`, но умножение переполняется (debug-паника). `10u64.saturating_mul(...)` + `.min(300)` |
 
 Zed: перезапускать целиком после установки тулчейна; `file_scan_exclusions` для
 `target`/`node_modules`/`dist`/`gen/schemas`; `procMacro.enable: true`.
@@ -288,20 +305,28 @@ Zed: перезапускать целиком после установки т�
    permission **и scope** в capabilities (одного `fs:allow-write-text-file` мало).
 2. URL индексатора не передаётся в payload — получатель зашит на `sia.storage`.
 3. Плоский список файлов в получателе вместо дерева папок.
-4. Нет blake3-хэша файла целиком (целостность только по размерам).
+4. **Закрыто:** per-chunk blake3 внедрён — хэш считается при чтении чанка на
+   загрузке (`HashingReader`, без лишнего прохода по файлу), хранится в
+   `ChunkMetadata.blake3`; получатель сверяет каждый скачанный чанк с диска
+   (`hash_file_range`) и в ZIP-потоке. Legacy-раздачи без хэша (`None`)
+   проверяются по размерам + Merkle-пруфы SDK. Хэш файла целиком не нужен.
 5. Нет интеграционных тестов. Локальной сети/`indexd` и `MockNetwork` пока не будет —
    решение отложено сознательно; интеграционные прогоны делаются вручную на бою
-   (см. раздел 8). Юнит-тесты чистого кода это не отменяет: на 2026-11-18 их **49**
-   (sia-core 32 + uploader 17) — `crypto`, `models`, `validate`, `group_summaries`,
-   `downloader` (resume/fingerprint), `db` (chunking/batch/finalize/migration/сироты),
-   `worker` (`compute_expires_at`). Без сети: temp SQLite + чистые функции.
+   (см. раздел 8). Юнит-тесты чистого кода это не отменяет: на 2026-11-18 их **56**
+   (sia-core 37 + uploader 19) — `crypto`, `models` (sanitize + blake3 serde),
+   `validate`, `group_summaries` (в т.ч. chunk_blake3), `downloader`
+   (resume/fingerprint/hash_file_range), `db` (chunking/batch/finalize/migration/сироты),
+   `worker` (`compute_expires_at`, `finalize_retry_delay`). Без сети: temp SQLite + чистые функции.
 6. **Закрыто:** `upload_packed` используется — мелкие чанки пакуются в общие слабы
    (`upload_packed_chunks`, `claim_next_pending_batch`), одиночный объект не жжёт
    целый слаб на паддинг.
 7. `fmt`/`clippy` в CI — advisory; `cargo fmt --all` применён (2026-11-18),
    clippy без предупреждений — можно ужесточать CI.
-8. `opt-level="z"` применяется и к отправителю; можно поднять до 3 через
-   `[profile.release.package.uploader-desktop]` (per-package работает только для `opt-level`).
+8. **Закрыто:** release-профиль `opt-level=3` — горячий код в `sia_storage` и
+   зависимостях (erasure coding, сеть) получает скорость; для `receiver-micro`
+   точечный override `[profile.release.package.receiver-micro] opt-level="z"` —
+   переносимый exe остаётся компактным. Поднимать только пакет uploader было бы
+   бесполезно: SDK остался бы на `"z"`.
 
 ## 11. Гигиена репозитория
 

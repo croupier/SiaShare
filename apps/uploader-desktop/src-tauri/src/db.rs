@@ -375,25 +375,24 @@ impl Database {
         Ok(n == 1)
     }
 
-    /// Следующая сессия для финализатора (единственный потребитель — гонок нет).
-    pub fn next_finalizing_session(&self) -> Result<Option<FinalizeTask>> {
+    /// Все сессии в 'finalizing' (старейшие первыми). Финализатор обходит их
+    /// списком, чтобы зависшая на backoff сессия не блокировала остальные.
+    pub fn finalizing_sessions(&self) -> Result<Vec<FinalizeTask>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id,name,expires_at,ttl_seconds,sharing_key_seed FROM upload_sessions
-             WHERE status='finalizing' ORDER BY created_at ASC LIMIT 1",
+             WHERE status='finalizing' ORDER BY created_at ASC",
         )?;
-        let mut rows = stmt.query([])?;
-        rows.next()?
-            .map(|r| -> Result<FinalizeTask> {
-                Ok(FinalizeTask {
-                    session_id: r.get(0)?,
-                    name: r.get(1)?,
-                    expires_at: r.get(2)?,
-                    ttl_seconds: r.get(3)?,
-                    seed_hex: r.get(4)?,
-                })
+        let rows = stmt.query_map([], |r| {
+            Ok(FinalizeTask {
+                session_id: r.get(0)?,
+                name: r.get(1)?,
+                expires_at: r.get(2)?,
+                ttl_seconds: r.get(3)?,
+                seed_hex: r.get(4)?,
             })
-            .transpose()
+        })?;
+        rows.collect()
     }
 
     /// Сохраняем seed СРАЗУ после создания ключа: повтор финализации не должен
@@ -544,18 +543,18 @@ mod tests {
             .unwrap();
         assert!(db.try_begin_finalize(&sid).unwrap());
         assert!(!db.try_begin_finalize(&sid).unwrap()); // повторно — уже finalizing
-        let f = db.next_finalizing_session().unwrap().unwrap();
+        let f = db.finalizing_sessions().unwrap().remove(0);
         assert_eq!(f.session_id, sid);
         // TTL хранится как есть; абсолютный expires_at вычислит финализатор
         assert_eq!(f.ttl_seconds, Some(123));
         assert_eq!(f.expires_at, None);
         db.save_session_seed(&sid, &"cc".repeat(32)).unwrap();
         assert_eq!(
-            db.next_finalizing_session().unwrap().unwrap().seed_hex,
+            db.finalizing_sessions().unwrap().remove(0).seed_hex,
             Some("cc".repeat(32))
         );
         db.mark_session_completed(&sid).unwrap();
-        assert!(db.next_finalizing_session().unwrap().is_none());
+        assert!(db.finalizing_sessions().unwrap().is_empty());
         assert_eq!(db.session_object_ids(&sid).unwrap(), vec!["bb".repeat(32)]);
     }
 
@@ -643,7 +642,7 @@ mod tests {
             .claim_next_pending_batch(DEFAULT_CHUNK_SIZE)
             .unwrap()
             .is_empty());
-        assert!(db.next_finalizing_session().unwrap().is_none());
+        assert!(db.finalizing_sessions().unwrap().is_empty());
     }
 
     #[test]
@@ -664,7 +663,7 @@ mod tests {
         drop(conn);
 
         let db = Database::init(&db_path).unwrap();
-        let f = db.next_finalizing_session().unwrap().unwrap();
+        let f = db.finalizing_sessions().unwrap().remove(0);
         assert_eq!(f.session_id, "old");
         assert_eq!(f.ttl_seconds, None); // старая строка — абсолютный expires_at
         assert_eq!(f.expires_at, Some(1893456000));

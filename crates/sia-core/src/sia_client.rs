@@ -1,16 +1,24 @@
 use crate::models::{sanitize_rel_path, ChunkMetadata, SharedFileEntry};
 use chrono::{DateTime, Utc};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use sia_storage::{
     app_id, AppKey, AppMetadata, Builder, Hash256, Object, PackedUploadOptions,
     RequestingApprovalState, Sdk, ShardProgress, SharedSdk, SharingKey, SharingKeyOptions,
 };
 use std::collections::HashMap;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::fs::File;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, ReadBuf, SeekFrom};
 
 pub const DEFAULT_INDEXER_URL: &str = "https://sia.storage";
 pub const DEFAULT_CHUNK_SIZE: u64 = 256 * 1024 * 1024; // 256 МиБ
+/// Лимит одновременных share/pin-запросов к индексатору. SDK-методы берут &self
+/// и не имеют разделяемого изменяемого состояния (запрос строится локально),
+/// поэтому параллелить безопасно; 4 — чтобы не залить индексатор сотнями RPC.
+const SHARE_PIN_CONCURRENCY: usize = 4;
 
 /// Метаданные приложения для индексатора.
 /// ВАЖНО: id участвует в деривации ключей шифрования пользователя — он
@@ -140,6 +148,34 @@ pub struct ChunkUploadSpec {
     pub meta: ChunkMetadata,
 }
 
+/// AsyncRead-обёртка, хэширующая байты по мере чтения (blake3). Позволяет
+/// посчитать хэш чанка БЕЗ лишнего прохода по файлу и без загрузки его в ОЗУ:
+/// байты идут в packed.add и параллельно в hasher. Hasher в Arc<Mutex> —
+/// после finalize извлекаем готовый хэш. R: Unpin (tokio File + Take — Unpin).
+struct HashingReader<R> {
+    inner: R,
+    hasher: Arc<Mutex<blake3::Hasher>>,
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for HashingReader<R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let this = &mut *self;
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = &res {
+            let new = &buf.filled()[before..];
+            if !new.is_empty() {
+                this.hasher.lock().unwrap().update(new);
+            }
+        }
+        res
+    }
+}
+
 /// Загружает пачку чанков отдельными объектами, но в ОБЩИХ слабах (PackedUpload).
 /// Одиночная загрузка мелкого объекта стоила бы целого слаба (30 шардов × 4 МиБ
 /// ≈ 120 МиБ трафика): SDK паддит неполные слабы до полного размера.
@@ -161,6 +197,7 @@ where
         ..PackedUploadOptions::default()
     };
     let mut packed = sdk.upload_packed(opts).map_err(sdk_err)?;
+    let mut hashers: Vec<Arc<Mutex<blake3::Hasher>>> = Vec::with_capacity(chunks.len());
     for c in chunks {
         let mut file = File::open(&c.local_path).await?;
         // Файл мог усохнуть между сканом и загрузкой: take() тогда тихо прочитал
@@ -173,19 +210,32 @@ where
             )));
         }
         file.seek(SeekFrom::Start(c.offset_bytes)).await?;
-        // AsyncReadExt::take читает строго `length_bytes` без загрузки чанка в ОЗУ
-        packed
-            .add(file.take(c.length_bytes))
-            .await
-            .map_err(sdk_err)?;
+        // take читает строго length_bytes без загрузки чанка в ОЗУ; HashingReader
+        // параллельно считает blake3 тех же байтов (лишний проход по файлу не нужен)
+        let hasher = Arc::new(Mutex::new(blake3::Hasher::new()));
+        let reader = HashingReader {
+            inner: file.take(c.length_bytes),
+            hasher: hasher.clone(),
+        };
+        packed.add(reader).await.map_err(sdk_err)?;
+        hashers.push(hasher);
     }
     let mut objects = packed.finalize().await.map_err(sdk_err)?;
-    for (obj, c) in objects.iter_mut().zip(chunks) {
-        obj.metadata = serde_json::to_vec(&c.meta)?;
+    for ((obj, c), hasher) in objects.iter_mut().zip(chunks).zip(&hashers) {
+        let mut meta = c.meta.clone();
+        // Хэш готов после finalize (все байты прошли через HashingReader)
+        meta.blake3 = Some(hasher.lock().unwrap().finalize().to_hex().to_string());
+        obj.metadata = serde_json::to_vec(&meta)?;
     }
-    for obj in &objects {
-        sdk.pin_object(obj).await.map_err(sdk_err)?;
-    }
+    // Пинним параллельно (порядок не важен — все объекты должны быть закреплены).
+    // objs — Copy-ссылка на срез: async move захватывает её, а не перемещает Vec,
+    // иначе objects нельзя было бы вернуть. Индексы вместо iter() — ради HRTB.
+    let objs = objects.as_slice();
+    stream::iter(0..objs.len())
+        .map(|i| async move { sdk.pin_object(&objs[i]).await.map_err(sdk_err) })
+        .buffer_unordered(SHARE_PIN_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
     Ok(objects)
 }
 
@@ -210,13 +260,19 @@ pub async fn share_session_objects(
             .await
             .map_err(sdk_err)?,
     };
-    for id in object_ids {
-        // В БД хранятся только идентификаторы; полный Object догружаем по id.
-        let obj = sdk.object(id).await.map_err(sdk_err)?;
-        sdk.share_object(&sharing_key, &obj)
-            .await
-            .map_err(sdk_err)?;
-    }
+    // Параллельная привязка: share_object идемпотентен (повтор заменяет re-sealed
+    // ключи), порядок не важен. key берём ссылкой; итерация по индексам, чтобы
+    // async-блок не заимствовал аргумент итератора (HRTB).
+    let key = &sharing_key;
+    stream::iter(0..object_ids.len())
+        .map(|i| async move {
+            // В БД хранятся только идентификаторы; полный Object догружаем по id.
+            let obj = sdk.object(&object_ids[i]).await.map_err(sdk_err)?;
+            sdk.share_object(key, &obj).await.map_err(sdk_err)
+        })
+        .buffer_unordered(SHARE_PIN_CONCURRENCY)
+        .try_collect::<Vec<()>>()
+        .await?;
     Ok(sharing_key.export())
 }
 
@@ -322,12 +378,17 @@ pub fn group_summaries_into_tree(
                 "{rel_path}: размеры не сходятся (total={total}, chunk_size={cs}, n={n})"
             )));
         }
+        // ids и blake3 в одном порядке (chunks отсортирован по chunk_idx)
+        let chunk_object_ids: Vec<String> = chunks.iter().map(|(_, id, _)| id.clone()).collect();
+        let chunk_blake3: Vec<Option<String>> =
+            chunks.iter().map(|(_, _, m)| m.blake3.clone()).collect();
         files.push(SharedFileEntry {
             rel_path,
             total_size: total,
             total_chunks: n,
             chunk_size: cs,
-            chunk_object_ids: chunks.into_iter().map(|(_, id, _)| id).collect(),
+            chunk_object_ids,
+            chunk_blake3,
         });
     }
     files.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
@@ -345,6 +406,7 @@ mod tests {
             total_chunks: n,
             total_file_size: total,
             chunk_size: cs,
+            blake3: None,
         }
     }
     fn item(id: &str, m: &ChunkMetadata) -> (String, Vec<u8>) {
@@ -430,5 +492,27 @@ mod tests {
             group_summaries_into_tree(vec![item("z", &z), item("a", &a), item("m", &m)]).unwrap();
         let paths: Vec<_> = tree.iter().map(|f| f.rel_path.as_str()).collect();
         assert_eq!(paths, vec!["a.txt", "dir/m.txt", "z.txt"]);
+    }
+
+    #[test]
+    fn test_tree_carries_blake3_in_chunk_order() {
+        let mut a = meta(0, 2, 500, 256);
+        a.blake3 = Some("aa".repeat(32));
+        let mut b = meta(1, 2, 500, 256);
+        b.blake3 = Some("bb".repeat(32));
+        // перемешанный порядок входа — дерево сортирует по chunk_idx
+        let tree = group_summaries_into_tree(vec![item("second", &b), item("first", &a)]).unwrap();
+        assert_eq!(tree[0].chunk_object_ids, vec!["first", "second"]);
+        assert_eq!(
+            tree[0].chunk_blake3,
+            vec![Some("aa".repeat(32)), Some("bb".repeat(32))]
+        );
+    }
+
+    #[test]
+    fn test_tree_legacy_blake3_is_none() {
+        // старые метаданные без blake3 → None (проверка на получателе пропускается)
+        let tree = group_summaries_into_tree(vec![item("a", &meta(0, 1, 10, 256))]).unwrap();
+        assert_eq!(tree[0].chunk_blake3, vec![None]);
     }
 }

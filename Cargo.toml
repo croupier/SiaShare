@@ -25,13 +25,23 @@ chrono = "0.4"
 hex = "0.4"
 walkdir = "2"
 tempfile = "3"
+# buffer_unordered для параллельных share/pin (лимит одновременных запросов).
+futures = "0.3"
+# Per-chunk хэш содержимого: сквозная проверка целостности поверх Merkle-пруфов SDK.
+blake3 = "1"
 # Системный keychain: AppKey нельзя хранить plaintext-файлом.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
-# Оптимизация под размер: критично для переносимого receiver-micro.
+# Скорость в приоритете для uploader: горячий код (erasure coding, сеть) внутри
+# sia_storage и зависимостей, поэтому opt-level=3 на весь release-профиль.
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "z"
+opt-level = 3
 strip = true
+
+# Переносимый receiver-micro распространяется внутри каждой раздачи — ему
+# критичен размер, а не скорость: точечный override обратно на "z".
+[profile.release.package.receiver-micro]
+opt-level = "z"
