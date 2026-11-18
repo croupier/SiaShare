@@ -36,6 +36,35 @@ fn expected_chunk_len(entry: &SharedFileEntry, idx: usize) -> u64 {
     }
 }
 
+/// Fingerprint докачки: id первого чанка + полный размер. Хранится в sidecar
+/// `<имя>.part.id` рядом с .part. Совпадение означает, что .part принадлежит
+/// именно этому файлу раздачи, а не другому с тем же именем.
+fn part_fingerprint(entry: &SharedFileEntry) -> String {
+    format!(
+        "{}\n{}",
+        entry
+            .chunk_object_ids
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+        entry.total_size
+    )
+}
+
+/// Можно ли доверять существующему .part. None (сайдкара нет — legacy .part)
+/// или несовпадение id/размера → false: тот же размер не гарантирует тот же
+/// файл, молчаливая докачка чужого .part выдала бы получателю битый файл.
+pub fn resume_is_trusted(sidecar: Option<&str>, first_object_id: &str, total_size: u64) -> bool {
+    match sidecar {
+        Some(s) => {
+            let mut lines = s.lines();
+            lines.next() == Some(first_object_id)
+                && lines.next().and_then(|l| l.parse::<u64>().ok()) == Some(total_size)
+        }
+        None => false,
+    }
+}
+
 /// Троттлинг прогресса: событие в UI не чаще раза в 200 мс (иначе флуд
 /// из десятков тысяч emit'ов на многогигабайтных файлах).
 struct Throttle(Option<Instant>);
@@ -115,10 +144,24 @@ where
         s.push(".part");
         s
     });
+    let id_path = PathBuf::from({
+        let mut s = part_path.as_os_str().to_owned();
+        s.push(".id");
+        s
+    });
 
+    let first_id = entry
+        .chunk_object_ids
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let sidecar = fs::read_to_string(&id_path).await.ok();
     let mut existing_len = fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
-    // Чужой/устаревший .part (от другого файла с тем же именем) — начинаем заново
-    if existing_len > entry.total_size {
+    // Чужой/устаревший .part: сайдкар не совпал или отсутствует (legacy) — заново.
+    // Одного размера мало: другой файл с тем же именем дал бы битую докачку.
+    if !resume_is_trusted(sidecar.as_deref(), first_id, entry.total_size)
+        || existing_len > entry.total_size
+    {
         existing_len = 0;
     }
     let (completed_chunks, partial) = calculate_resume_chunk(existing_len, entry.chunk_size);
@@ -131,6 +174,8 @@ where
         .await?;
     out_file.set_len(existing_len).await?;
     out_file.seek(SeekFrom::Start(existing_len)).await?;
+    // Фиксируем fingerprint для следующей докачки (перезапись идемпотентна)
+    fs::write(&id_path, part_fingerprint(entry)).await?;
 
     let watcher = CancelWatcher::new(cancel.clone());
     let mut downloaded = existing_len;
@@ -212,6 +257,7 @@ where
         fs::remove_file(dest_path).await?;
     }
     fs::rename(&part_path, dest_path).await?;
+    let _ = fs::remove_file(&id_path).await; // докачка завершена — сайдкар не нужен
     Ok(())
 }
 
@@ -343,5 +389,35 @@ mod tests {
         };
         assert_eq!(expected_chunk_len(&e, 0), 256);
         assert_eq!(expected_chunk_len(&e, 1), 244);
+    }
+
+    fn entry_with(first_id: &str, total: u64) -> SharedFileEntry {
+        SharedFileEntry {
+            rel_path: "a.bin".into(),
+            total_size: total,
+            total_chunks: 1,
+            chunk_size: 256,
+            chunk_object_ids: vec![first_id.into()],
+        }
+    }
+
+    #[test]
+    fn test_resume_fingerprint_roundtrip() {
+        let e = entry_with("abc123", 500);
+        let fp = part_fingerprint(&e);
+        assert!(resume_is_trusted(Some(&fp), "abc123", 500));
+    }
+
+    #[test]
+    fn test_resume_untrusted_cases() {
+        // нет сайдкара (legacy .part) — не доверяем, начинаем заново
+        assert!(!resume_is_trusted(None, "abc", 500));
+        // чужой id первого чанка (другой файл с тем же именем)
+        assert!(!resume_is_trusted(Some("other\n500"), "abc", 500));
+        // другой размер
+        assert!(!resume_is_trusted(Some("abc\n999"), "abc", 500));
+        // битый формат
+        assert!(!resume_is_trusted(Some("abc"), "abc", 500));
+        assert!(!resume_is_trusted(Some("abc\nnotanumber"), "abc", 500));
     }
 }

@@ -39,6 +39,10 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Проваленная раздача не держит квоту | `cleanup_session`: `delete_object` по id + `prune_slabs`, статус `cleaned` | `commands.rs` |
 | Отмена прерывает зависший хост | `CancelWatcher`: poll флага 200 мс + `Notify` + `select!` над read | `downloader.rs` |
 | Имена, несовместимые с Windows | Preflight `validate_paths`: запрещённые символы/имена, регистровые коллизии, лимиты 255/200; UI — игнор или отмена | `validate.rs`, `App.svelte` |
+| Argon2id не блокирует рантайм | `decrypt_with_password` и `build_receiver_filename` — в `spawn_blocking` | `commands.rs` (оба приложения) |
+| Обход папок не глотает ошибки | Ошибки `WalkDir` → `Err` (не `filter_map(ok)`), обход в `spawn_blocking` | `collect_files_recursive` |
+| Автовход различает «нет ключа» и сбой | `keyring::NoEntry` → `Ok(false)`; прочие ошибки keychain/сети → `Err`; UI ловит + «Повторить автовход» | `check_saved_auth`, `App.svelte` |
+| Докачка не клеит чужой `.part` | Sidecar `.part.id` (id первого чанка + размер); не совпал/нет → заново | `downloader.rs` |
 | AppKey не в plaintext | Системный keychain (`keyring` v3), запись `siashare-desktop` / `sia-app-key` | `commands.rs` |
 | Папки и ZIP >4 ГиБ | Синхронный `zip` с `large_file(true)` на `spawn_blocking`, мост async→sync через `Handle::block_on` | `download_as_zip` |
 | Малый переносимый receiver | Tauri v2 + Rust-ядро + тонкий Svelte; release: `opt-level="z"`, `lto`, `panic="abort"`, `strip` | корневой `Cargo.toml` |
@@ -58,21 +62,21 @@ UI не знает про Sia и крипту. Вся сеть, файлы и к
 
 ```
 Cargo.toml                       workspace: 3 крейта, общие версии зависимостей
-crates/sia-core/src/             ядро без зависимости от Tauri (1314 строк)
+crates/sia-core/src/             ядро без зависимости от Tauri (1390 строк)
   sia_client.rs   408            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
-  downloader.rs   347            .part-докачка, ZIP64, отмена, троттлинг
+  downloader.rs   423            .part-докачка, ZIP64, отмена, троттлинг, .part.id
   crypto.rs       260            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
   models.rs        69            ChunkMetadata, SharedFileEntry, sanitize_rel_path
   validate.rs     221            preflight-проверка имён на совместимость с Windows
   lib.rs            9            только pub mod
-apps/uploader-desktop/src-tauri/src/   (1427 строк)
+apps/uploader-desktop/src-tauri/src/   (1447 строк)
   db.rs           636            схема SQLite, claim/finalize, счётчики, тесты
-  commands.rs     391            9 Tauri-команд + обход папок + дедуп путей
+  commands.rs     411            9 Tauri-команд + обход папок + дедуп путей
   worker.rs       313            пул воркеров + финализатор
   main.rs          87            плагины, setup, manage
-apps/uploader-desktop/src/App.svelte   338
-apps/receiver-micro/src-tauri/src/     (224 строки)
-  commands.rs     189            6 Tauri-команд, гейт скачивания
+apps/uploader-desktop/src/App.svelte   352
+apps/receiver-micro/src-tauri/src/     (228 строк)
+  commands.rs     193            6 Tauri-команд, гейт скачивания
   main.rs          35            без single-instance — намеренно
 apps/receiver-micro/src/App.svelte     190
 .github/workflows/ci-cd.yml     109    CI + релиз по тегу v* на трёх ОС
@@ -119,6 +123,10 @@ build.ps1 / build.sh             17    receiver → resources → установ
 проваленной/отозванной раздачи (`failed`/`revoked` → `cleaned`) и освобождает
 квоту; для активной `completed`-раздачи команда возвращает ошибку.
 
+`check_saved_auth` возвращает `Ok(false)` только когда ключа реально нет
+(`keyring::NoEntry`) или он отозван (`Ok(None)` от SDK). Сбой keychain/сети —
+это `Err`: UI показывает ошибку и кнопку «Повторить автовход», а не экран входа.
+
 `validate_paths` — preflight перед `start_upload_session`: обходит пути и
 возвращает предупреждения о несовместимости с Windows (запрещённые символы
 `< > : " \ | ? *` и управляющие, зарезервированные имена CON/PRN/AUX/NUL/
@@ -126,9 +134,9 @@ COM1–9/LPT1–9/CONIN$/CONOUT$, точка/пробел в конце комп
 >255 UTF-16 единиц, полный rel_path >200 — мягко, коллизии регистра вроде
 1.txt/1.TXT). UI показывает модалку со списком и двумя кнопками: **Отмена**
 (пользователь исправляет имена сам) и **Игнорировать и загрузить** (грузим
-как есть). Получателя НЕ меняли: его `sanitize_rel_path` остаётся последней
-обороной и по-прежнему роняет всё дерево при небезопасном пути — осознанный
-выбор владельца (скачивание не трогаем).
+как есть). В рамках проверки имён получателя не меняли: его `sanitize_rel_path`
+остаётся последней обороной и по-прежнему роняет всё дерево при небезопасном
+пути — осознанный выбор владельца.
 
 События: `auth-url` (string), `auth-phrase` (string), `chunk-progress`
 `{session_id,file_id,chunk_index,fraction}`, `session-progress` `{session_id,uploaded,total,failed}`,
@@ -189,7 +197,9 @@ Fallback — `key.sia` рядом с бинарником (подъём до 4 �
 3. Сид-фраза показывается один раз и автоматически на диск не пишется.
    AppKey — только в keychain. Ни то, ни другое не логируется.
 4. Файл не читается целиком в память.
-5. `.part` не переименовывается в итоговый файл без проверки размера.
+5. `.part` не переименовывается в итоговый файл без проверки размера; докачка
+   доверяет `.part` только при совпадении sidecar `.part.id` (id первого чанка +
+   размер). Legacy `.part` без сайдкара недоверен — качается заново.
 6. Ошибки целостности не проглатываются (`filter_map(...ok())` запрещён в этих путях).
 7. Формат блоба версионирован (`p1_`); смена параметров KDF → новый префикс.
 8. Старый `S#…exe` должен открываться новой версией ядра.

@@ -45,20 +45,25 @@ fn keyring_entry() -> Result<keyring::Entry, String> {
 }
 
 /// 1. Автовход по ключу из СИСТЕМНОГО keychain (не plaintext-файл!).
+/// Различаем «ключа нет» (Ok(false) → экран входа) и сбои хранилища/сети
+/// (Err → UI показывает ошибку и даёт повтор), иначе временный сбой keychain
+/// или сети молча выдавал бы себя за отсутствие ключа.
 #[tauri::command]
 pub async fn check_saved_auth(state: State<'_, UploaderState>) -> Result<bool, String> {
     let hex_key = match keyring_entry()?.get_password() {
         Ok(k) => k,
-        Err(_) => return Ok(false), // ключа нет — покажем экран входа
+        Err(keyring::Error::NoEntry) => return Ok(false), // ключа нет — покажем экран входа
+        Err(e) => return Err(format!("Keychain: {e}")),
     };
-    let bytes = hex::decode(&hex_key).map_err(|e| e.to_string())?;
+    let bytes = hex::decode(&hex_key).map_err(|e| format!("Повреждённый ключ в keychain: {e}"))?;
     match connect_with_app_key(&bytes).await {
         Ok(Some(sdk)) => {
             activate_sdk(&state, sdk);
             Ok(true)
         }
         // None = ключ отозван/недействителен — нужен повторный approval
-        _ => Ok(false),
+        Ok(None) => Ok(false),
+        Err(e) => Err(format!("Сеть Sia: {e}")),
     }
 }
 
@@ -116,7 +121,10 @@ pub async fn start_upload_session(
         .ok_or("Срок жизни ссылки слишком велик")?;
     let sdk = current_sdk(&state)?;
 
-    let mut collected = collect_files_recursive(&paths)?;
+    // Обход дерева — блокирующая ФС-операция, не держим async-рантайм
+    let mut collected = tokio::task::spawn_blocking(move || collect_files_recursive(&paths))
+        .await
+        .map_err(|e| e.to_string())??;
     if collected.is_empty() {
         return Err("Не найдено ни одного файла".into());
     }
@@ -171,7 +179,7 @@ pub fn collect_files_recursive(
     for raw_path in input_paths {
         let root = Path::new(raw_path);
         if !root.exists() {
-            continue;
+            return Err(format!("Путь не найден: {raw_path}"));
         }
         if root.is_file() {
             let meta = fs::metadata(root).map_err(|e| e.to_string())?;
@@ -184,7 +192,10 @@ pub fn collect_files_recursive(
         } else if root.is_dir() {
             // Берем родительскую директорию, чтобы имя выбранной папки вошло в rel_path
             let base_parent = root.parent().unwrap_or(root);
-            for entry in WalkDir::new(root).into_iter().filter_map(|e| e.ok()) {
+            // Ошибки обхода (например, permission denied) НЕ проглатываем:
+            // молчаливый пропуск подпапки выдал бы неполную раздачу как целую
+            for entry in WalkDir::new(root) {
+                let entry = entry.map_err(|e| e.to_string())?;
                 if entry.file_type().is_file() {
                     let full_path = entry.path();
                     let meta = entry.metadata().map_err(|e| e.to_string())?;
@@ -211,7 +222,9 @@ pub fn collect_files_recursive(
 /// или отмена (пользователь исправляет имена сам). Получателя не трогаем.
 #[tauri::command]
 pub async fn validate_paths(paths: Vec<String>) -> Result<Vec<PathWarning>, String> {
-    let collected = collect_files_recursive(&paths)?;
+    let collected = tokio::task::spawn_blocking(move || collect_files_recursive(&paths))
+        .await
+        .map_err(|e| e.to_string())??;
     let rels: Vec<String> = collected.into_iter().map(|(_, rel, _)| rel).collect();
     Ok(validate_windows_paths(&rels))
 }
@@ -239,11 +252,11 @@ pub async fn generate_share_zip(
     } else {
         ""
     };
-    let inner_exe_name = build_receiver_filename(&sharing_key_bytes, password.as_deref(), ext)
-        .map_err(|e| e.to_string())?;
-
-    // Файловые операции — в блокирующем потоке, чтобы не тормозить async-рантайм
+    // Файловые операции и Argon2id (если задан пароль) — в блокирующем потоке,
+    // чтобы не тормозить async-рантайм
     tokio::task::spawn_blocking(move || {
+        let inner_exe_name = build_receiver_filename(&sharing_key_bytes, password.as_deref(), ext)
+            .map_err(|e| e.to_string())?;
         let mut template_file = File::open(&template_path)
             .map_err(|e| format!("Не удалось открыть шаблон {template_path:?}: {e}"))?;
         let mut exe_bytes = Vec::new();
@@ -371,6 +384,13 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].1, "My Project/docs/readme.md");
         assert_eq!(files[0].2, 5);
+    }
+
+    #[test]
+    fn test_missing_path_is_error_not_silent_skip() {
+        let dir = tempdir().unwrap();
+        let missing = dir.path().join("no_such_dir").to_string_lossy().to_string();
+        assert!(collect_files_recursive(&[missing]).is_err());
     }
 
     #[test]

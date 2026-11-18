@@ -107,9 +107,20 @@
     });
 
     // Автовход по ключу из системного keychain
-    isConnected = await invoke<boolean>('check_saved_auth');
-    if (isConnected) await restoreSession();
+    await autoLogin();
   });
+
+  async function autoLogin() {
+    authError = '';
+    try {
+      isConnected = await invoke<boolean>('check_saved_auth');
+      if (isConnected) await restoreSession();
+    } catch (e) {
+      // Сбой keychain/сети — не «ключа нет»: показываем ошибку и даём повтор
+      isConnected = false;
+      authError = `Автовход не удался: ${e}`;
+    }
+  }
 
   function connect(newAccount: boolean) {
     authError = ''; authUrl = ''; authWaiting = true;
@@ -223,6 +234,9 @@
         </div>
       {/if}
       {#if authError}<p class="mt-4 text-sm text-red-400">{authError}</p>{/if}
+      {#if authError && !authWaiting}
+        <button class="btn-secondary mt-3" on:click={autoLogin}>Повторить автовход</button>
+      {/if}
     </div>
   {:else}
     {#if backupPhrase}

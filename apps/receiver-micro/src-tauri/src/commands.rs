@@ -81,7 +81,11 @@ pub async fn unlock_with_password(
         .await
         .clone()
         .ok_or("Зашифрованный ключ не найден")?;
-    let raw_key = decrypt_with_password(&blob, &password).map_err(|e| e.to_string())?;
+    // Argon2id CPU-ёмкий (~19 МиБ, t=2) — в блокирующем потоке, не в async-рантайме
+    let raw_key = tokio::task::spawn_blocking(move || decrypt_with_password(&blob, &password))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| e.to_string())?;
     load_files_with_key(&state, &raw_key).await
 }
 
