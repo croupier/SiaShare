@@ -4,6 +4,7 @@ use sia_core::sia_client::{
     begin_connection, connect_with_app_key, ensure_capacity, finish_connection, parse_object_id,
     revoke_share,
 };
+use sia_core::validate::{validate_windows_paths, PathWarning};
 use sia_storage::Sdk;
 use std::collections::HashSet;
 use std::fs::{self, File};
@@ -203,6 +204,16 @@ pub fn collect_files_recursive(
         }
     }
     Ok(result)
+}
+
+/// Preflight: проверка путей на совместимость с Windows ДО постановки в очередь.
+/// UI показывает список предупреждений и даёт выбор: игнор (грузим как есть)
+/// или отмена (пользователь исправляет имена сам). Получателя не трогаем.
+#[tauri::command]
+pub async fn validate_paths(paths: Vec<String>) -> Result<Vec<PathWarning>, String> {
+    let collected = collect_files_recursive(&paths)?;
+    let rels: Vec<String> = collected.into_iter().map(|(_, rel, _)| rel).collect();
+    Ok(validate_windows_paths(&rels))
 }
 
 /// 4. Собирает Sia.zip: шаблон receiver-micro + имя S#r_/S#p1_<ключ>.exe.

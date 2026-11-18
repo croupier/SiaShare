@@ -38,6 +38,7 @@ Tauri-команд и публичный API `sia_storage` из кэша cargo) 
 | Срок жизни не съедается загрузкой | TTL отсчитывается от финализации; `validDays=0` → `expires_at=None` (вечная шара) | `worker.rs`, `db.rs` |
 | Проваленная раздача не держит квоту | `cleanup_session`: `delete_object` по id + `prune_slabs`, статус `cleaned` | `commands.rs` |
 | Отмена прерывает зависший хост | `CancelWatcher`: poll флага 200 мс + `Notify` + `select!` над read | `downloader.rs` |
+| Имена, несовместимые с Windows | Preflight `validate_paths`: запрещённые символы/имена, регистровые коллизии, лимиты 255/200; UI — игнор или отмена | `validate.rs`, `App.svelte` |
 | AppKey не в plaintext | Системный keychain (`keyring` v3), запись `siashare-desktop` / `sia-app-key` | `commands.rs` |
 | Папки и ZIP >4 ГиБ | Синхронный `zip` с `large_file(true)` на `spawn_blocking`, мост async→sync через `Handle::block_on` | `download_as_zip` |
 | Малый переносимый receiver | Tauri v2 + Rust-ядро + тонкий Svelte; release: `opt-level="z"`, `lto`, `panic="abort"`, `strip` | корневой `Cargo.toml` |
@@ -57,22 +58,23 @@ UI не знает про Sia и крипту. Вся сеть, файлы и к
 
 ```
 Cargo.toml                       workspace: 3 крейта, общие версии зависимостей
-crates/sia-core/src/             ядро без зависимости от Tauri (821 строка)
-  sia_client.rs   305            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
-  downloader.rs   246            .part-докачка, ZIP64, отмена, троттлинг
-  crypto.rs       202            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
-  models.rs        61            ChunkMetadata, SharedFileEntry, sanitize_rel_path
-  lib.rs            7            только pub mod
-apps/uploader-desktop/src-tauri/src/   (766 строк)
-  db.rs           346            схема SQLite, claim/finalize, счётчики, тесты
-  commands.rs     210            6 Tauri-команд + обход папок + дедуп путей
-  worker.rs       168            пул воркеров + финализатор
-  main.rs          42            плагины, setup, manage
-apps/uploader-desktop/src/App.svelte   208
-apps/receiver-micro/src-tauri/src/     (144 строки)
-  commands.rs     112            6 Tauri-команд, гейт скачивания
-  main.rs          32            без single-instance — намеренно
-apps/receiver-micro/src/App.svelte     183
+crates/sia-core/src/             ядро без зависимости от Tauri (1314 строк)
+  sia_client.rs   408            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
+  downloader.rs   347            .part-докачка, ZIP64, отмена, троттлинг
+  crypto.rs       260            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
+  models.rs        69            ChunkMetadata, SharedFileEntry, sanitize_rel_path
+  validate.rs     221            preflight-проверка имён на совместимость с Windows
+  lib.rs            9            только pub mod
+apps/uploader-desktop/src-tauri/src/   (1427 строк)
+  db.rs           636            схема SQLite, claim/finalize, счётчики, тесты
+  commands.rs     391            9 Tauri-команд + обход папок + дедуп путей
+  worker.rs       313            пул воркеров + финализатор
+  main.rs          87            плагины, setup, manage
+apps/uploader-desktop/src/App.svelte   338
+apps/receiver-micro/src-tauri/src/     (224 строки)
+  commands.rs     189            6 Tauri-команд, гейт скачивания
+  main.rs          35            без single-instance — намеренно
+apps/receiver-micro/src/App.svelte     190
 .github/workflows/ci-cd.yml     109    CI + релиз по тегу v* на трёх ОС
 build.ps1 / build.sh             17    receiver → resources → установщики
 ```
@@ -90,6 +92,8 @@ build.ps1 / build.sh             17    receiver → resources → установ
   `extract_key_from_path`:66, `parse_payload`:86, `decrypt_with_password`:123
   (`encrypt_with_password` и `derive_key` — приватные)
 - `models`: `ChunkMetadata`:6, `SharedFileEntry`:21, `sanitize_rel_path`:37
+- `validate`: `PATH_LEN_WARN`=200, `COMPONENT_LEN_MAX`=255, `PathWarningKind`,
+  `PathWarning`, `validate_windows_paths` (чистая функция + тесты)
 
 Стек фронта: **Svelte 4.2 + Vite 5 + TypeScript**, без SvelteKit, менеджер — **npm**.
 Порты dev: отправитель **1420** (HMR 1421), получатель **1430** (HMR 1431).
@@ -103,6 +107,7 @@ build.ps1 / build.sh             17    receiver → resources → установ
 |---|---|---|
 | `check_saved_auth` | — | `bool` |
 | `connect_sia` | `seedPhrase: string \| null` | `()` |
+| `validate_paths` | `paths: string[]` | `PathWarning[]` `{rel_path,kind,message}` |
 | `start_upload_session` | `sessionName, paths: string[], validDays` | `sessionId` |
 | `generate_share_zip` | `outputZipPath, sharingKeyBytes: number[], password` | `()` |
 | `revoke_session` | `sessionId` | `()` |
@@ -113,6 +118,17 @@ build.ps1 / build.sh             17    receiver → resources → установ
 финализации, а не от создания сессии. `cleanup_session` удаляет объекты
 проваленной/отозванной раздачи (`failed`/`revoked` → `cleaned`) и освобождает
 квоту; для активной `completed`-раздачи команда возвращает ошибку.
+
+`validate_paths` — preflight перед `start_upload_session`: обходит пути и
+возвращает предупреждения о несовместимости с Windows (запрещённые символы
+`< > : " \ | ? *` и управляющие, зарезервированные имена CON/PRN/AUX/NUL/
+COM1–9/LPT1–9/CONIN$/CONOUT$, точка/пробел в конце компонента, компонент
+>255 UTF-16 единиц, полный rel_path >200 — мягко, коллизии регистра вроде
+1.txt/1.TXT). UI показывает модалку со списком и двумя кнопками: **Отмена**
+(пользователь исправляет имена сам) и **Игнорировать и загрузить** (грузим
+как есть). Получателя НЕ меняли: его `sanitize_rel_path` остаётся последней
+обороной и по-прежнему роняет всё дерево при небезопасном пути — осознанный
+выбор владельца (скачивание не трогаем).
 
 События: `auth-url` (string), `auth-phrase` (string), `chunk-progress`
 `{session_id,file_id,chunk_index,fraction}`, `session-progress` `{session_id,uploaded,total,failed}`,

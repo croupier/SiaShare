@@ -6,3 +6,4 @@ pub mod crypto;
 pub mod downloader;
 pub mod models;
 pub mod sia_client;
+pub mod validate;

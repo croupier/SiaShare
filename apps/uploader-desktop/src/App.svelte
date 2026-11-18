@@ -36,6 +36,11 @@
   let revoked = false;
   let cleaned = false; // объекты сессии удалены из Sia (cleanup_session)
 
+  // --- Preflight: несовместимые с Windows имена (игнор или отмена) ---
+  interface PathWarning { rel_path: string; kind: string; message: string }
+  let pathWarnings: PathWarning[] = [];
+  let pendingPaths: string[] | null = null;
+
   $: inflightSum = [...inflight.values()].reduce((a, b) => a + b, 0);
   $: percent = totalChunks > 0
     ? Math.min(100, Math.round(((uploadedChunks + inflightSum) / totalChunks) * 100))
@@ -124,6 +129,15 @@
     const selected = await open({ directory: isDirectory, multiple: !isDirectory });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
+    // Preflight: предупреждаем о несовместимых с Windows именах до загрузки
+    try {
+      const warnings = await invoke<PathWarning[]>('validate_paths', { paths });
+      if (warnings.length) { pendingPaths = paths; pathWarnings = warnings; return; }
+    } catch (e) { alert(`Ошибка проверки путей: ${e}`); return; }
+    await startUpload(paths);
+  }
+
+  async function startUpload(paths: string[]) {
     // Сброс состояния прошлой раздачи
     completedKeyBytes = null; revoked = false; cleaned = false; uploadError = ''; lastChunkError = '';
     uploadedChunks = 0; totalChunks = 0; failedChunks = 0; inflight = new Map();
@@ -134,6 +148,14 @@
         'get_session_progress', { sessionId: activeSessionId });
       totalChunks = t; uploadedChunks = u; failedChunks = f;
     } catch (e) { activeSessionId = null; alert(`Ошибка запуска загрузки: ${e}`); }
+  }
+
+  function closeWarnings() { pathWarnings = []; pendingPaths = null; }
+
+  async function ignoreWarnings() {
+    const paths = pendingPaths;
+    closeWarnings();
+    if (paths) await startUpload(paths);
   }
 
   async function exportShareZip() {
@@ -291,5 +313,26 @@
         {/if}
       </div>
     {/if}
+  {/if}
+
+  {#if pathWarnings.length}
+    <div class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-6">
+      <div class="card max-h-[80vh] w-full max-w-lg overflow-auto">
+        <h3 class="mb-2 text-lg font-semibold text-amber-300">Несовместимые с Windows имена ({pathWarnings.length})</h3>
+        <p class="muted mb-4">Получатель на Windows может не сохранить эти файлы или молча перезаписать одноимённые. Исправьте имена сами и повторите — или загрузите как есть на свой риск.</p>
+        <ul class="mb-4 flex flex-col gap-2">
+          {#each pathWarnings as w}
+            <li class="rounded-lg border border-amber-500/30 bg-amber-500/5 p-2 text-sm">
+              <span class="block break-all font-medium text-slate-200">{w.rel_path}</span>
+              <span class="muted">{w.message}</span>
+            </li>
+          {/each}
+        </ul>
+        <div class="flex gap-3">
+          <button class="btn-primary" on:click={closeWarnings}>Отмена</button>
+          <button class="btn-secondary" on:click={ignoreWarnings}>Игнорировать и загрузить</button>
+        </div>
+      </div>
+    </div>
   {/if}
 </main>
