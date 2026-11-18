@@ -6,6 +6,7 @@
 
   // --- Авторизация ---
   let isConnected = false;
+  let authChecked = false;   // до результата проверки не показываем форму входа
   let authWaiting = false;   // ждем одобрения на странице индексатора
   let authUrl = '';          // fallback-ссылка (браузер открывает Rust-сторона)
   let authError = '';
@@ -112,6 +113,7 @@
 
   async function autoLogin() {
     authError = '';
+    authChecked = false;
     try {
       isConnected = await invoke<boolean>('check_saved_auth');
       if (isConnected) await restoreSession();
@@ -119,6 +121,8 @@
       // Сбой keychain/сети — не «ключа нет»: показываем ошибку и даём повтор
       isConnected = false;
       authError = `Автовход не удался: ${e}`;
+    } finally {
+      authChecked = true;
     }
   }
 
@@ -213,7 +217,11 @@
     {/if}
   </header>
 
-  {#if !isConnected}
+  {#if !authChecked}
+    <div class="card">
+      <p class="animate-pulse text-sm text-slate-300">Проверка подключения к Sia Storage…</p>
+    </div>
+  {:else if !isConnected}
     <div class="card">
       <h2 class="mb-4 text-lg font-semibold">Подключение к Sia Storage</h2>
       {#if authWaiting}
