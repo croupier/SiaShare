@@ -66,4 +66,16 @@ mod tests {
         assert!(sanitize_rel_path("a//b").is_none());
         assert!(sanitize_rel_path("").is_none());
     }
+
+    #[test]
+    fn test_sanitize_rel_path_length_and_dot_segment() {
+        // >1024 байт — отказ (защита от раздутых метаданных)
+        let long = format!("dir/{}", "a".repeat(1024));
+        assert!(sanitize_rel_path(&long).is_none());
+        // ровно 1024 — допустимо
+        assert!(sanitize_rel_path(&"a".repeat(1024)).is_some());
+        // сегмент "." запрещён
+        assert!(sanitize_rel_path("a/./b").is_none());
+        assert!(sanitize_rel_path(".").is_none());
+    }
 }

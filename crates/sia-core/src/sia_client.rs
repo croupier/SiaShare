@@ -405,4 +405,30 @@ mod tests {
         assert_eq!(parse_object_id(&id.to_string()).unwrap(), id);
         assert!(parse_object_id("zzz").is_err());
     }
+
+    #[test]
+    fn test_contradictory_chunk_metadata_is_error() {
+        let a = meta(0, 2, 500, 256);
+        let mut b = meta(1, 2, 500, 256);
+        b.total_file_size = 600; // противоречит чанку 0 — ошибка, не тихая склейка
+        assert!(group_summaries_into_tree(vec![item("a", &a), item("b", &b)]).is_err());
+        // противоречие по chunk_size тоже ловится
+        let mut c = meta(1, 2, 500, 256);
+        c.chunk_size = 128;
+        assert!(group_summaries_into_tree(vec![item("a", &a), item("c", &c)]).is_err());
+    }
+
+    #[test]
+    fn test_tree_sorted_by_rel_path() {
+        let mut z = meta(0, 1, 10, 256);
+        z.rel_path = "z.txt".into();
+        let mut a = meta(0, 1, 10, 256);
+        a.rel_path = "a.txt".into();
+        let mut m = meta(0, 1, 10, 256);
+        m.rel_path = "dir/m.txt".into();
+        let tree =
+            group_summaries_into_tree(vec![item("z", &z), item("a", &a), item("m", &m)]).unwrap();
+        let paths: Vec<_> = tree.iter().map(|f| f.rel_path.as_str()).collect();
+        assert_eq!(paths, vec!["a.txt", "dir/m.txt", "z.txt"]);
+    }
 }

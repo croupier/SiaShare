@@ -62,17 +62,17 @@ UI не знает про Sia и крипту. Вся сеть, файлы и к
 
 ```
 Cargo.toml                       workspace: 3 крейта, общие версии зависимостей
-crates/sia-core/src/             ядро без зависимости от Tauri (1390 строк)
-  sia_client.rs   408            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
+crates/sia-core/src/             ядро без зависимости от Tauri (1510 строк)
+  sia_client.rs   434            SDK-обёртка: вход, квота, загрузка, шаринг, дерево
   downloader.rs   423            .part-докачка, ZIP64, отмена, троттлинг, .part.id
-  crypto.rs       260            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
-  models.rs        69            ChunkMetadata, SharedFileEntry, sanitize_rel_path
-  validate.rs     221            preflight-проверка имён на совместимость с Windows
+  crypto.rs       304            имя S#…, Argon2id+AES-GCM, parse_payload, key.sia
+  models.rs        81            ChunkMetadata, SharedFileEntry, sanitize_rel_path
+  validate.rs     259            preflight-проверка имён на совместимость с Windows
   lib.rs            9            только pub mod
-apps/uploader-desktop/src-tauri/src/   (1447 строк)
-  db.rs           636            схема SQLite, claim/finalize, счётчики, тесты
+apps/uploader-desktop/src-tauri/src/   (1535 строк)
+  db.rs           674            схема SQLite, claim/finalize, счётчики, тесты
   commands.rs     411            9 Tauri-команд + обход папок + дедуп путей
-  worker.rs       313            пул воркеров + финализатор
+  worker.rs       363            пул воркеров + финализатор, compute_expires_at
   main.rs          87            плагины, setup, manage
 apps/uploader-desktop/src/App.svelte   352
 apps/receiver-micro/src-tauri/src/     (228 строк)
@@ -291,8 +291,13 @@ Zed: перезапускать целиком после установки т�
 4. Нет blake3-хэша файла целиком (целостность только по размерам).
 5. Нет интеграционных тестов. Локальной сети/`indexd` и `MockNetwork` пока не будет —
    решение отложено сознательно; интеграционные прогоны делаются вручную на бою
-   (см. раздел 8), юнит-тесты чистого кода (`crypto`, `db`, `models`) это не отменяет.
-6. `upload_packed` не используется: мелкие файлы паддятся до слаба, квота тратится зря.
+   (см. раздел 8). Юнит-тесты чистого кода это не отменяет: на 2026-11-18 их **49**
+   (sia-core 32 + uploader 17) — `crypto`, `models`, `validate`, `group_summaries`,
+   `downloader` (resume/fingerprint), `db` (chunking/batch/finalize/migration/сироты),
+   `worker` (`compute_expires_at`). Без сети: temp SQLite + чистые функции.
+6. **Закрыто:** `upload_packed` используется — мелкие чанки пакуются в общие слабы
+   (`upload_packed_chunks`, `claim_next_pending_batch`), одиночный объект не жжёт
+   целый слаб на паддинг.
 7. `fmt`/`clippy` в CI — advisory; `cargo fmt --all` применён (2026-11-18),
    clippy без предупреждений — можно ужесточать CI.
 8. `opt-level="z"` применяется и к отправителю; можно поднять до 3 через
