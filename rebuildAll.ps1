@@ -1,3 +1,4 @@
+cargo test --workspace; `
 cd apps\receiver-micro; npm install; npm run build; cd ..\..\; `
 cd apps\uploader-desktop; npm install; npm run build; cd ..\..\; `
 cargo test --workspace; `
