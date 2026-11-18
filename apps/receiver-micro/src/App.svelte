@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { save } from '@tauri-apps/plugin-dialog';
@@ -27,7 +27,36 @@
   let total = 0;
   let notice = '';
 
+  // --- Скорость: скользящее окно ~3 с по приросту байтов ---
+  let speedSamples: { t: number; bytes: number }[] = [];
+  let speedBps = 0; // байт/с
+  let speedTimer: ReturnType<typeof setInterval> | undefined;
+
+  function pushSpeedSample(bytes: number) {
+    const now = performance.now();
+    const last = speedSamples[speedSamples.length - 1];
+    // Откат счетчика — сдвигаем окно, сохраняя набранные дельты
+    if (last && bytes < last.bytes) {
+      const drop = last.bytes - bytes;
+      speedSamples = speedSamples.map((s) => ({ t: s.t, bytes: s.bytes - drop }));
+    }
+    speedSamples.push({ t: now, bytes });
+    while (speedSamples.length > 2 && now - speedSamples[0].t > 3000) speedSamples.shift();
+    refreshSpeed(now);
+  }
+
+  function refreshSpeed(now: number) {
+    if (speedSamples.length < 2) { speedBps = 0; return; }
+    const first = speedSamples[0];
+    const last = speedSamples[speedSamples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    // Нет свежих событий дольше 2 с — скачивание встало
+    if (dt < 0.5 || now - last.t > 2000) { speedBps = 0; return; }
+    speedBps = Math.max(0, (last.bytes - first.bytes) / dt);
+  }
+
   $: percent = total > 0 ? Math.round((downloaded / total) * 100) : 0;
+  $: pushSpeedSample(downloaded);
 
   function applyInit(res: InitResponse) {
     if (res.status === 'Ready') {
@@ -49,7 +78,12 @@
     });
     try { applyInit(await invoke<InitResponse>('init_receiver')); }
     catch (e) { errorMessage = String(e); status = 'error'; }
+
+    // Пересчет скорости даже без событий: пауза должна гасить счетчик
+    speedTimer = setInterval(() => refreshSpeed(performance.now()), 1000);
   });
+
+  onDestroy(() => clearInterval(speedTimer));
 
   async function handleUnlock() {
     pwdError = '';
@@ -78,6 +112,7 @@
 
   async function runDownload(mode: 'one' | 'zip', fn: () => Promise<void>) {
     isDownloading = true; downloadMode = mode; downloaded = 0; total = 0; notice = '';
+    speedSamples = []; speedBps = 0;
     try {
       await fn();
       notice = mode === 'zip' ? 'Архив успешно сохранён.' : 'Файл успешно скачан.';
@@ -110,11 +145,22 @@
   }
 
   function formatBytes(bytes: number): string {
-    if (bytes === 0) return '0 Б';
+    if (bytes <= 0) return '0 Б';
     const k = 1024;
     const sizes = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return `${(bytes / Math.pow(k, i)).toFixed(2)} ${sizes[i]}`;
+    const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
+    const v = bytes / Math.pow(k, i);
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${sizes[i]}`;
+  }
+
+  function formatSpeed(bytesPerSec: number): string {
+    const bits = bytesPerSec * 8;
+    if (bits < 1000) return `${bits.toFixed(0)} бит/с`;
+    const k = 1000;
+    const units = ['Кбит/с', 'Мбит/с', 'Гбит/с'];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bits) / Math.log(k)) - 1);
+    const v = bits / Math.pow(k, i + 1);
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
   }
 </script>
 
@@ -164,9 +210,13 @@
 
     {#if isDownloading}
       <div class="card mb-4">
-        <div class="relative mb-3 h-6 overflow-hidden rounded-full bg-slate-800">
+        <div class="relative mb-2 h-6 overflow-hidden rounded-full bg-slate-800">
           <div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-[width] duration-200" style="width:{percent}%"></div>
-          <span class="absolute inset-0 grid place-items-center text-xs font-semibold text-white">{percent}% · {formatBytes(downloaded)} / {formatBytes(total)}</span>
+          <span class="absolute inset-0 grid place-items-center text-xs font-semibold text-white">{percent}%</span>
+        </div>
+        <div class="mb-3 flex items-baseline justify-between gap-3 text-xs">
+          <span class="text-slate-400">{formatBytes(downloaded)} из {formatBytes(total)}</span>
+          <span class="font-semibold tabular-nums text-emerald-300">{formatSpeed(speedBps)}</span>
         </div>
         <button class="btn-danger" on:click={() => invoke('cancel_download')}>Отменить</button>
       </div>

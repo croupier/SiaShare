@@ -14,12 +14,32 @@ use tokio::sync::{watch, Semaphore};
 const MAX_CHUNK_ATTEMPTS: u32 = 8;
 const MAX_FINALIZE_ATTEMPTS: u32 = 5;
 
+/// Срок жизни раздачи ОТ МОМЕНТА ФИНАЛИЗАЦИИ: ключ создаётся здесь, и долгая
+/// загрузка не съедает TTL. ttl_seconds=0 → None (вечная шара, SDK: no expiry).
+/// Старые строки БД (ttl_seconds=NULL) → абсолютный expires_at. `now` передаётся
+/// параметром ради детерминированных тестов.
+fn compute_expires_at(
+    ttl_seconds: Option<i64>,
+    legacy_expires_at: Option<i64>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    match ttl_seconds {
+        Some(0) => Ok(None),
+        Some(ttl) => chrono::Duration::try_seconds(ttl)
+            .and_then(|d| now.checked_add_signed(d))
+            .map(Some)
+            .ok_or_else(|| "срок жизни раздачи слишком велик".to_string()),
+        None => Ok(legacy_expires_at.and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))),
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
 struct ChunkProgress {
     session_id: String,
     file_id: String,
     chunk_index: u32,
     fraction: f64,
+    length_bytes: u64,
 }
 #[derive(Clone, serde::Serialize)]
 struct SessionProgress {
@@ -27,6 +47,8 @@ struct SessionProgress {
     uploaded: i64,
     total: i64,
     failed: i64,
+    total_bytes: i64,
+    uploaded_bytes: i64,
 }
 
 /// Запускает пул воркеров + финализатор. Возвращает sender для подмены SDK:
@@ -95,9 +117,16 @@ pub fn start_upload_workers(
                     let start = Instant::now();
                     // Одна доля на всю пачку, рассылаемая по всем ее чанкам:
                     // UI суммирует доли чанков — агрегированный прогресс сходится
-                    let targets: Vec<(String, String, u32)> = tasks
+                    let targets: Vec<(String, String, u32, u64)> = tasks
                         .iter()
-                        .map(|t| (t.session_id.clone(), t.file_id.clone(), t.chunk_index))
+                        .map(|t| {
+                            (
+                                t.session_id.clone(),
+                                t.file_id.clone(),
+                                t.chunk_index,
+                                t.length_bytes,
+                            )
+                        })
                         .collect();
                     let (app_cb, targets_cb) = (app.clone(), targets.clone());
                     let (sent_cb, last_cb) = (sent.clone(), last_ms.clone());
@@ -113,7 +142,7 @@ pub fn start_upload_workers(
                                 .is_ok()
                         {
                             let fraction = (total as f64 / expected_encoded).min(1.0);
-                            for (sid, fid, cidx) in &targets_cb {
+                            for (sid, fid, cidx, len) in &targets_cb {
                                 let _ = app_cb.emit(
                                     "chunk-progress",
                                     ChunkProgress {
@@ -121,6 +150,7 @@ pub fn start_upload_workers(
                                         file_id: fid.clone(),
                                         chunk_index: *cidx,
                                         fraction,
+                                        length_bytes: *len,
                                     },
                                 );
                             }
@@ -155,6 +185,8 @@ pub fn start_upload_workers(
                                 let _ = app.emit("chunk-uploaded", sid.clone());
                                 if let Ok((total, uploaded, failed)) = db.session_chunk_counts(&sid)
                                 {
+                                    let (total_bytes, uploaded_bytes) =
+                                        db.session_byte_counts(&sid).unwrap_or((0, 0));
                                     let _ = app.emit(
                                         "session-progress",
                                         SessionProgress {
@@ -162,6 +194,8 @@ pub fn start_upload_workers(
                                             uploaded,
                                             total,
                                             failed,
+                                            total_bytes,
+                                            uploaded_bytes,
                                         },
                                     );
                                 }
@@ -253,21 +287,9 @@ pub fn start_upload_workers(
                         .iter()
                         .map(|s| parse_object_id(s).map_err(|e| e.to_string()))
                         .collect::<Result<_, _>>()?;
-                    // TTL отсчитывается от ФИНАЛИЗАЦИИ: ключ создается здесь, и
-                    // долгая загрузка не должна съедать срок жизни раздачи.
-                    // ttl_seconds=0 — вечная шара (SDK: expires_at=None = no expiry).
-                    // Старые строки БД (ttl_seconds=NULL): expires_at — абсолютный.
-                    let expires = match task.ttl_seconds {
-                        Some(0) => None,
-                        Some(ttl) => Some(
-                            chrono::Duration::try_seconds(ttl)
-                                .and_then(|d| chrono::Utc::now().checked_add_signed(d))
-                                .ok_or_else(|| "срок жизни раздачи слишком велик".to_string())?,
-                        ),
-                        None => task
-                            .expires_at
-                            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0)),
-                    };
+                    // TTL отсчитывается от ФИНАЛИЗАЦИИ (см. compute_expires_at)
+                    let expires =
+                        compute_expires_at(task.ttl_seconds, task.expires_at, chrono::Utc::now())?;
                     let existing = task
                         .seed_hex
                         .as_deref()
@@ -310,4 +332,47 @@ pub fn start_upload_workers(
         });
     }
     sdk_tx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{DateTime, Utc};
+
+    fn ts(secs: i64) -> DateTime<Utc> {
+        DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    #[test]
+    fn test_ttl_zero_is_eternal() {
+        let now = ts(1_000_000);
+        assert_eq!(compute_expires_at(Some(0), None, now).unwrap(), None);
+        // ttl_seconds задан — legacy expires_at игнорируется
+        assert_eq!(compute_expires_at(Some(0), Some(5), now).unwrap(), None);
+    }
+
+    #[test]
+    fn test_ttl_counts_from_now() {
+        let now = ts(1_000_000);
+        assert_eq!(
+            compute_expires_at(Some(86400), None, now).unwrap(),
+            Some(ts(1_086_400))
+        );
+    }
+
+    #[test]
+    fn test_legacy_absolute_expires() {
+        let now = ts(1_000_000);
+        // ttl_seconds=NULL — старая строка, expires_at абсолютный
+        assert_eq!(
+            compute_expires_at(None, Some(1893456000), now).unwrap(),
+            Some(ts(1893456000))
+        );
+        assert_eq!(compute_expires_at(None, None, now).unwrap(), None);
+    }
+
+    #[test]
+    fn test_ttl_overflow_is_error() {
+        assert!(compute_expires_at(Some(i64::MAX), None, ts(1_000_000)).is_err());
+    }
 }

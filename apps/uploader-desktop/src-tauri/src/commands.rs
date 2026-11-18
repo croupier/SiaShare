@@ -348,16 +348,22 @@ pub async fn cleanup_session(
         .map_err(|e| e.to_string())
 }
 
-/// Прогресс сессии для инициализации UI сразу после создания/перезапуска.
+/// Прогресс сессии для инициализации UI сразу после создания/перезапуска:
+/// (чанков всего, загружено, провалено, байт всего, байт загружено).
 #[tauri::command]
 pub async fn get_session_progress(
     session_id: String,
     state: State<'_, UploaderState>,
-) -> Result<(i64, i64, i64), String> {
-    state
+) -> Result<(i64, i64, i64, i64, i64), String> {
+    let (total, uploaded, failed) = state
         .db
         .session_chunk_counts(&session_id)
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    let (total_bytes, uploaded_bytes) = state
+        .db
+        .session_byte_counts(&session_id)
+        .map_err(|e| e.to_string())?;
+    Ok((total, uploaded, failed, total_bytes, uploaded_bytes))
 }
 
 /// Список сессий (новые первыми) — UI восстанавливает активную раздачу после перезапуска.

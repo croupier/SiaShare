@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { onMount, onDestroy } from 'svelte';
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { open, save } from '@tauri-apps/plugin-dialog';
@@ -23,29 +23,84 @@
     id: string; name: string; status: string; created_at: number;
     last_error: string | null; seed_hex: string | null;
     total: number; uploaded: number; failed: number;
+    total_bytes: number; uploaded_bytes: number;
   }
 
   let activeSessionId: string | null = null;
   let totalChunks = 0;
   let uploadedChunks = 0;
   let failedChunks = 0;
+  let totalBytes = 0;
+  let uploadedBytes = 0;
   let uploadError = '';
   let lastChunkError = '';
-  // Доли незавершенных чанков (file_id:chunk_index -> 0..1) для живого прогресса
-  let inflight = new Map<string, number>();
+  // Доли незавершенных чанков (file_id:chunk_index -> доля и размер) для живого прогресса
+  let inflight = new Map<string, { fraction: number; length: number }>();
   let completedKeyBytes: number[] | null = null;
   let revoked = false;
   let cleaned = false; // объекты сессии удалены из Sia (cleanup_session)
+
+  // --- Скорость: скользящее окно ~3 с по приросту байтов ---
+  let speedSamples: { t: number; bytes: number }[] = [];
+  let speedBps = 0; // байт/с
+  let speedTimer: ReturnType<typeof setInterval> | undefined;
+
+  function pushSpeedSample(bytes: number) {
+    const now = performance.now();
+    const last = speedSamples[speedSamples.length - 1];
+    // Оценка байтов может просесть (сброс долей при session-progress, retry):
+    // сдвигаем окно на величину просадки, чтобы не терять набранную скорость
+    if (last && bytes < last.bytes) {
+      const drop = last.bytes - bytes;
+      speedSamples = speedSamples.map((s) => ({ t: s.t, bytes: s.bytes - drop }));
+    }
+    speedSamples.push({ t: now, bytes });
+    while (speedSamples.length > 2 && now - speedSamples[0].t > 3000) speedSamples.shift();
+    refreshSpeed(now);
+  }
+
+  function refreshSpeed(now: number) {
+    if (speedSamples.length < 2) { speedBps = 0; return; }
+    const first = speedSamples[0];
+    const last = speedSamples[speedSamples.length - 1];
+    const dt = (last.t - first.t) / 1000;
+    // Нет свежих событий дольше 2 с — передача встала (пауза/ретрай)
+    if (dt < 0.5 || now - last.t > 2000) { speedBps = 0; return; }
+    speedBps = Math.max(0, (last.bytes - first.bytes) / dt);
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes <= 0) return '0 Б';
+    const k = 1024;
+    const sizes = ['Б', 'КБ', 'МБ', 'ГБ', 'ТБ'];
+    const i = Math.min(sizes.length - 1, Math.floor(Math.log(bytes) / Math.log(k)));
+    const v = bytes / Math.pow(k, i);
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${sizes[i]}`;
+  }
+
+  function formatSpeed(bytesPerSec: number): string {
+    const bits = bytesPerSec * 8;
+    if (bits < 1000) return `${bits.toFixed(0)} бит/с`;
+    const k = 1000;
+    const units = ['Кбит/с', 'Мбит/с', 'Гбит/с'];
+    const i = Math.min(units.length - 1, Math.floor(Math.log(bits) / Math.log(k)) - 1);
+    const v = bits / Math.pow(k, i + 1);
+    return `${v >= 100 ? v.toFixed(0) : v.toFixed(1)} ${units[i]}`;
+  }
 
   // --- Preflight: несовместимые с Windows имена (игнор или отмена) ---
   interface PathWarning { rel_path: string; kind: string; message: string }
   let pathWarnings: PathWarning[] = [];
   let pendingPaths: string[] | null = null;
 
-  $: inflightSum = [...inflight.values()].reduce((a, b) => a + b, 0);
+  $: inflightSum = [...inflight.values()].reduce((a, b) => a + b.fraction, 0);
   $: percent = totalChunks > 0
     ? Math.min(100, Math.round(((uploadedChunks + inflightSum) / totalChunks) * 100))
     : 0;
+  // Байты закрепленных чанков + оценка незавершенных по их долям
+  $: inflightBytes = [...inflight.values()].reduce((a, b) => a + b.fraction * b.length, 0);
+  $: uploadedBytesEst = Math.min(totalBytes, uploadedBytes + inflightBytes);
+  $: pushSpeedSample(uploadedBytesEst);
 
   function hexToBytes(hex: string): number[] {
     return Array.from(hex.match(/.{2}/g) ?? [], (b) => parseInt(b, 16));
@@ -62,6 +117,7 @@
     activeSessionId = s.id;
     sessionName = s.name;
     totalChunks = s.total; uploadedChunks = s.uploaded; failedChunks = s.failed;
+    totalBytes = s.total_bytes; uploadedBytes = s.uploaded_bytes;
     inflight = new Map();
     lastChunkError = '';
     uploadError = s.status === 'failed' ? (s.last_error ?? 'Раздача не удалась') : '';
@@ -77,18 +133,21 @@
 
     // Точные счетчики чанков из БД; доли сбросятся и перезаполнятся
     // воркерами в течение ~250 мс (троттлинг прогресса на Rust-стороне)
-    await listen<{ session_id: string; uploaded: number; total: number; failed: number }>(
+    await listen<{ session_id: string; uploaded: number; total: number; failed: number;
+                   total_bytes: number; uploaded_bytes: number }>(
       'session-progress', (e) => {
         const p = e.payload;
         if (p.session_id !== activeSessionId) return;
         uploadedChunks = p.uploaded; totalChunks = p.total; failedChunks = p.failed;
+        totalBytes = p.total_bytes; uploadedBytes = p.uploaded_bytes;
         inflight = new Map();
       });
-    await listen<{ session_id: string; file_id: string; chunk_index: number; fraction: number }>(
+    await listen<{ session_id: string; file_id: string; chunk_index: number;
+                   fraction: number; length_bytes: number }>(
       'chunk-progress', (e) => {
         const p = e.payload;
         if (p.session_id !== activeSessionId) return;
-        inflight.set(`${p.file_id}:${p.chunk_index}`, p.fraction);
+        inflight.set(`${p.file_id}:${p.chunk_index}`, { fraction: p.fraction, length: p.length_bytes });
         inflight = inflight; // присваивание триггерит реактивность Svelte
       });
     await listen<{ session_id: string; error: string; failed: boolean }>('chunk-error', (e) => {
@@ -109,7 +168,12 @@
 
     // Автовход по ключу из системного keychain
     await autoLogin();
+
+    // Пересчет скорости даже без событий: пауза между пачками должна гасить счетчик
+    speedTimer = setInterval(() => refreshSpeed(performance.now()), 1000);
   });
+
+  onDestroy(() => clearInterval(speedTimer));
 
   async function autoLogin() {
     authError = '';
@@ -156,12 +220,14 @@
     // Сброс состояния прошлой раздачи
     completedKeyBytes = null; revoked = false; cleaned = false; uploadError = ''; lastChunkError = '';
     uploadedChunks = 0; totalChunks = 0; failedChunks = 0; inflight = new Map();
+    totalBytes = 0; uploadedBytes = 0; speedSamples = []; speedBps = 0;
     try {
       activeSessionId = await invoke<string>('start_upload_session', { sessionName, paths, validDays });
       // Сразу подтягиваем счетчики: воркеры могли начать раньше первого события
-      const [t, u, f] = await invoke<[number, number, number]>(
+      const [t, u, f, tb, ub] = await invoke<[number, number, number, number, number]>(
         'get_session_progress', { sessionId: activeSessionId });
       totalChunks = t; uploadedChunks = u; failedChunks = f;
+      totalBytes = tb; uploadedBytes = ub;
     } catch (e) { activeSessionId = null; alert(`Ошибка запуска загрузки: ${e}`); }
   }
 
@@ -287,9 +353,13 @@
 
     {#if activeSessionId && !completedKeyBytes && !uploadError}
       <div class="card mb-6">
-        <div class="relative mb-3 h-6 overflow-hidden rounded-full bg-slate-800">
+        <div class="relative mb-2 h-6 overflow-hidden rounded-full bg-slate-800">
           <div class="h-full rounded-full bg-gradient-to-r from-emerald-500 to-emerald-400 transition-[width] duration-200" style="width:{percent}%"></div>
           <span class="absolute inset-0 grid place-items-center text-xs font-semibold text-white">{percent}%</span>
+        </div>
+        <div class="mb-3 flex items-baseline justify-between gap-3 text-xs">
+          <span class="text-slate-400">{formatBytes(uploadedBytesEst)} из {formatBytes(totalBytes)}</span>
+          <span class="font-semibold tabular-nums text-emerald-300">{formatSpeed(speedBps)}</span>
         </div>
         <p class="text-sm text-slate-300">Закреплено чанков: <strong class="text-white">{uploadedChunks}</strong> из {totalChunks}
           {#if failedChunks > 0}<span class="text-amber-400">(ошибок: {failedChunks})</span>{/if}

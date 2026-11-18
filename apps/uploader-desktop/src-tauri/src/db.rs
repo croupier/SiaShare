@@ -36,6 +36,8 @@ pub struct SessionInfo {
     pub total: i64,
     pub uploaded: i64,
     pub failed: i64,
+    pub total_bytes: i64,
+    pub uploaded_bytes: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -306,12 +308,26 @@ impl Database {
         )
     }
 
+    /// (всего байт, загружено байт) — для прогресса сессии в UI.
+    pub fn session_byte_counts(&self, session_id: &str) -> Result<(i64, i64)> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT COALESCE(SUM(c.length_bytes),0),
+                    COALESCE(SUM(CASE WHEN c.status='uploaded' THEN c.length_bytes END),0)
+             FROM upload_chunks c JOIN upload_files f ON c.file_id=f.id WHERE f.session_id=?1",
+            params![session_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+    }
+
     /// Все сессии с прогрессом — для восстановления UI после перезапуска.
     pub fn list_sessions(&self) -> Result<Vec<SessionInfo>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT s.id, s.name, s.status, s.created_at, s.last_error, s.sharing_key_seed,
-                    COUNT(c.chunk_index), COALESCE(SUM(c.status='uploaded'),0), COALESCE(SUM(c.status='failed'),0)
+                    COUNT(c.chunk_index), COALESCE(SUM(c.status='uploaded'),0), COALESCE(SUM(c.status='failed'),0),
+                    COALESCE(SUM(c.length_bytes),0),
+                    COALESCE(SUM(CASE WHEN c.status='uploaded' THEN c.length_bytes END),0)
              FROM upload_sessions s
              LEFT JOIN upload_files f ON f.session_id=s.id
              LEFT JOIN upload_chunks c ON c.file_id=f.id
@@ -329,6 +345,8 @@ impl Database {
                 total: r.get(6)?,
                 uploaded: r.get(7)?,
                 failed: r.get(8)?,
+                total_bytes: r.get(9)?,
+                uploaded_bytes: r.get(10)?,
             })
         })?;
         rows.collect()
@@ -559,7 +577,27 @@ mod tests {
         assert_eq!(list[0].id, sid);
         assert_eq!(list[0].status, "uploading");
         assert_eq!((list[0].total, list[0].uploaded, list[0].failed), (1, 1, 0));
+        assert_eq!((list[0].total_bytes, list[0].uploaded_bytes), (10, 10));
         assert!(list[0].seed_hex.is_none());
+    }
+
+    #[test]
+    fn test_session_byte_counts_partial() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        let size = DEFAULT_CHUNK_SIZE + 100; // два чанка: полный и хвост 100 байт
+        let sid = db
+            .create_session("S", &[("p".into(), "f".into(), size)], 0)
+            .unwrap();
+        assert_eq!(db.session_byte_counts(&sid).unwrap(), (size as i64, 0));
+        let batch = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap();
+        let t = batch.iter().find(|t| t.chunk_index == 0).unwrap();
+        db.mark_chunk_uploaded(&t.file_id, 0, &"bb".repeat(32))
+            .unwrap();
+        assert_eq!(
+            db.session_byte_counts(&sid).unwrap(),
+            (size as i64, DEFAULT_CHUNK_SIZE as i64)
+        );
     }
 
     #[test]
@@ -632,5 +670,43 @@ mod tests {
         assert_eq!(f.expires_at, Some(1893456000));
         // Повторный init не падает на уже существующей колонке
         Database::init(&db_path).unwrap();
+    }
+
+    #[test]
+    fn test_mark_uploaded_returns_orphan_id() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        db.create_session("S", &[("p".into(), "f".into(), 10)], 0)
+            .unwrap();
+        let t = db
+            .claim_next_pending_batch(DEFAULT_CHUNK_SIZE)
+            .unwrap()
+            .remove(0);
+        let first = "aa".repeat(32);
+        let second = "bb".repeat(32);
+        // первая загрузка — сироты нет
+        assert_eq!(db.mark_chunk_uploaded(&t.file_id, 0, &first).unwrap(), None);
+        // повтор с ТЕМ ЖЕ id — не сирота
+        assert_eq!(db.mark_chunk_uploaded(&t.file_id, 0, &first).unwrap(), None);
+        // повтор с ДРУГИМ id — возвращает старый для удаления (иначе течёт квота)
+        assert_eq!(
+            db.mark_chunk_uploaded(&t.file_id, 0, &second).unwrap(),
+            Some(first)
+        );
+    }
+
+    #[test]
+    fn test_empty_file_is_one_zero_chunk() {
+        let dir = tempdir().unwrap();
+        let db = Database::init(&dir.path().join("t.db")).unwrap();
+        let sid = db
+            .create_session("S", &[("p".into(), "empty.bin".into(), 0)], 0)
+            .unwrap();
+        let batch = db.claim_next_pending_batch(DEFAULT_CHUNK_SIZE).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch[0].length_bytes, 0);
+        assert_eq!(batch[0].offset_bytes, 0);
+        assert_eq!(batch[0].total_chunks, 1);
+        assert_eq!(db.session_chunk_counts(&sid).unwrap(), (1, 0, 0));
     }
 }
