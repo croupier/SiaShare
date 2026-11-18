@@ -8,6 +8,7 @@ apps/uploader-desktop/src-tauri/resources/receiver-micro
 apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
 
 # Локальная очередь загрузок
+/storage/
 *.db
 *.db-wal
 *.db-shm
@@ -15,7 +16,15 @@ apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
 # Сгенерированные Tauri схемы
 **/gen/schemas
 
+# Временные файлы Vite (остатки после жёсткого завершения dev-сервера)
+*.timestamp-*.mjs
+
 # Отсебятина
 .env
 /.srcBuilders
 package-lock.json
+
+# Dev-файлы только в ветке qwen
+/Cargo copy.toml
+/collect-context.ps1
+/CONTEXT_DUMP.md

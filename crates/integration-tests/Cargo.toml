@@ -1,0 +1,22 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Сквозные тесты обоих приложений против одной мок-сети SDK в одном процессе:
+# реальные воркеры/БД/команды uploader-а и реальные команды receiver-а.
+[build-dependencies]
+tauri-winres = "0.3"
+
+[dev-dependencies]
+sia-core = { path = "../sia-core" }
+uploader-desktop = { path = "../../apps/uploader-desktop/src-tauri" }
+receiver-micro = { path = "../../apps/receiver-micro/src-tauri" }
+sia_storage = { workspace = true, features = ["mock"] }
+tauri = { version = "2", features = ["test"] }
+tokio = { workspace = true }
+tempfile = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
+zip = { workspace = true }

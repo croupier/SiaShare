@@ -10,6 +10,7 @@ use std::io::Write as _;
 use std::time::{Duration, Instant};
 use tokio::fs::{self, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::sync::Notify;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
@@ -18,7 +19,10 @@ use zip::{CompressionMethod, ZipWriter};
 /// записи, поэтому продолжать можно с произвольного смещения, а не только
 /// с границы чанка.
 pub fn calculate_resume_chunk(existing_part_size: u64, chunk_size: u64) -> (usize, u64) {
-    ((existing_part_size / chunk_size) as usize, existing_part_size % chunk_size)
+    (
+        (existing_part_size / chunk_size) as usize,
+        existing_part_size % chunk_size,
+    )
 }
 
 /// Ожидаемая длина чанка idx: последний чанк короче, пустой файл = 0.
@@ -26,7 +30,62 @@ fn expected_chunk_len(entry: &SharedFileEntry, idx: usize) -> u64 {
     if entry.total_size == 0 {
         0
     } else {
-        entry.chunk_size.min(entry.total_size - idx as u64 * entry.chunk_size)
+        entry
+            .chunk_size
+            .min(entry.total_size - idx as u64 * entry.chunk_size)
+    }
+}
+
+/// Читает `len` байт файла с диска от `offset` и возвращает blake3 (hex).
+/// Побайтовое чтение блоками — без загрузки чанка в ОЗУ. Недочитанное (файл
+/// короче ожидаемого) = ошибка целостности, а не тихий успех. len=0 → blake3("").
+async fn hash_file_range(path: &Path, offset: u64, len: u64) -> Result<String, SiaClientError> {
+    let mut f = fs::File::open(path).await?;
+    f.seek(SeekFrom::Start(offset)).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut remaining = len;
+    let mut buf = vec![0u8; 256 * 1024];
+    while remaining > 0 {
+        let want = (buf.len() as u64).min(remaining) as usize;
+        let n = f.read(&mut buf[..want]).await?;
+        if n == 0 {
+            return Err(SiaClientError::Integrity(format!(
+                "{}: чанк короче ожидаемого при проверке blake3",
+                path.display()
+            )));
+        }
+        hasher.update(&buf[..n]);
+        remaining -= n as u64;
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+/// Fingerprint докачки: id первого чанка + полный размер. Хранится в sidecar
+/// `<имя>.part.id` рядом с .part. Совпадение означает, что .part принадлежит
+/// именно этому файлу раздачи, а не другому с тем же именем.
+fn part_fingerprint(entry: &SharedFileEntry) -> String {
+    format!(
+        "{}\n{}",
+        entry
+            .chunk_object_ids
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or(""),
+        entry.total_size
+    )
+}
+
+/// Можно ли доверять существующему .part. None (сайдкара нет — legacy .part)
+/// или несовпадение id/размера → false: тот же размер не гарантирует тот же
+/// файл, молчаливая докачка чужого .part выдала бы получателю битый файл.
+pub fn resume_is_trusted(sidecar: Option<&str>, first_object_id: &str, total_size: u64) -> bool {
+    match sidecar {
+        Some(s) => {
+            let mut lines = s.lines();
+            lines.next() == Some(first_object_id)
+                && lines.next().and_then(|l| l.parse::<u64>().ok()) == Some(total_size)
+        }
+        None => false,
     }
 }
 
@@ -38,7 +97,10 @@ impl Throttle {
         Self(None)
     }
     fn tick(&mut self, force: bool) -> bool {
-        let due = self.0.map(|t| t.elapsed() >= Duration::from_millis(200)).unwrap_or(true);
+        let due = self
+            .0
+            .map(|t| t.elapsed() >= Duration::from_millis(200))
+            .unwrap_or(true);
         if force || due {
             self.0 = Some(Instant::now());
             true
@@ -57,13 +119,43 @@ fn dl_opts(offset: u64) -> DownloadOptions {
     }
 }
 
+/// Будит зависшее чтение при отмене: AtomicBool сам по себе не прерывает
+/// read, а замолчавший хост может держать его открытым сколько угодно.
+/// Watcher опрашивает флаг каждые 200 мс и будит select! через Notify
+/// (notify_one копит permit, поэтому сигнал не теряется между чтениями).
+/// Задача abort'ится в Drop — watcher живет ровно одно скачивание.
+struct CancelWatcher {
+    notify: Arc<Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl CancelWatcher {
+    fn new(cancel: Arc<AtomicBool>) -> Self {
+        let notify = Arc::new(Notify::new());
+        let n = notify.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                if cancel.load(Ordering::Relaxed) {
+                    n.notify_one();
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+        Self { notify, task }
+    }
+}
+impl Drop for CancelWatcher {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Скачивает один файл (1..N чанков) на диск с байтовой докачкой через .part.
 /// Отмена: cancel=true -> Err(Cancelled), .part сохраняется для продолжения.
 pub async fn download_single_file<F>(
     shared: &SharedSdk,
     entry: &SharedFileEntry,
     dest_path: &Path,
-    cancel: &AtomicBool,
+    cancel: Arc<AtomicBool>,
     mut on_progress: F,
 ) -> Result<(), SiaClientError>
 where
@@ -76,18 +168,40 @@ where
         s.push(".part");
         s
     });
+    let id_path = PathBuf::from({
+        let mut s = part_path.as_os_str().to_owned();
+        s.push(".id");
+        s
+    });
 
+    let first_id = entry
+        .chunk_object_ids
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let sidecar = fs::read_to_string(&id_path).await.ok();
     let mut existing_len = fs::metadata(&part_path).await.map(|m| m.len()).unwrap_or(0);
-    // Чужой/устаревший .part (от другого файла с тем же именем) — начинаем заново
-    if existing_len > entry.total_size {
+    // Чужой/устаревший .part: сайдкар не совпал или отсутствует (legacy) — заново.
+    // Одного размера мало: другой файл с тем же именем дал бы битую докачку.
+    if !resume_is_trusted(sidecar.as_deref(), first_id, entry.total_size)
+        || existing_len > entry.total_size
+    {
         existing_len = 0;
     }
     let (completed_chunks, partial) = calculate_resume_chunk(existing_len, entry.chunk_size);
 
-    let mut out_file = OpenOptions::new().create(true).write(true).open(&part_path).await?;
+    let mut out_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false) // .part дописывается с existing_len, не перезаписывается
+        .open(&part_path)
+        .await?;
     out_file.set_len(existing_len).await?;
     out_file.seek(SeekFrom::Start(existing_len)).await?;
+    // Фиксируем fingerprint для следующей докачки (перезапись идемпотентна)
+    fs::write(&id_path, part_fingerprint(entry)).await?;
 
+    let watcher = CancelWatcher::new(cancel.clone());
     let mut downloaded = existing_len;
     let mut throttle = Throttle::new();
     on_progress(downloaded, entry.total_size);
@@ -103,9 +217,14 @@ where
             continue;
         }
         let id = parse_object_id(object_id)?;
-        let obj = shared.object(&id).await.map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+        let obj = shared
+            .object(&id)
+            .await
+            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
         // download — СИНХРОННЫЙ метод, возвращает AsyncRead-хэндл; drop = отмена
-        let reader = shared.download(&obj, dl_opts(skip)).map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+        let reader = shared
+            .download(&obj, dl_opts(skip))
+            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
         let mut reader = std::pin::pin!(reader);
 
         let mut chunk_read = 0u64;
@@ -115,7 +234,15 @@ where
                 out_file.flush().await?;
                 return Err(SiaClientError::Cancelled);
             }
-            let n = reader.read(&mut buf).await?;
+            // Отмена прерывает даже зависший read: недописанные байты не
+            // попадают в .part, докачка продолжится с длины файла на диске
+            let n = tokio::select! {
+                r = reader.read(&mut buf) => r?,
+                _ = watcher.notify.notified() => {
+                    out_file.flush().await?;
+                    return Err(SiaClientError::Cancelled);
+                }
+            };
             if n == 0 {
                 break;
             }
@@ -130,15 +257,34 @@ where
         if skip + chunk_read != expected {
             return Err(SiaClientError::Integrity(format!(
                 "{}: чанк {idx} скачан на {} байт вместо {}",
-                entry.rel_path, skip + chunk_read, expected
+                entry.rel_path,
+                skip + chunk_read,
+                expected
             )));
+        }
+        // blake3 содержимого (если отправитель прислал хэш): читаем ВЕСЬ чанк с
+        // диска и сверяем — это покрывает и докачанный префикс. Legacy-раздачи
+        // без хэша (None) пропускаем: для них остаются Merkle-пруфы SDK.
+        if let Some(expected_hex) = entry.chunk_blake3.get(idx).and_then(|o| o.as_deref()) {
+            out_file.flush().await?;
+            let actual =
+                hash_file_range(&part_path, idx as u64 * entry.chunk_size, expected).await?;
+            if actual != expected_hex {
+                return Err(SiaClientError::Integrity(format!(
+                    "{}: чанк {idx} не сошёлся по blake3 (ожидался {expected_hex}, получен {actual})",
+                    entry.rel_path
+                )));
+            }
         }
     }
 
     // Финальная проверка РАЗМЕРА: без нее недостающий чанк превратился бы
     // в "успешно скачанный" битый файл.
     if downloaded != entry.total_size {
-        return Err(SiaClientError::Integrity(format!("{}: скачано {downloaded} байт из {}", entry.rel_path, entry.total_size)));
+        return Err(SiaClientError::Integrity(format!(
+            "{}: скачано {downloaded} байт из {}",
+            entry.rel_path, entry.total_size
+        )));
     }
     out_file.flush().await?;
     drop(out_file);
@@ -149,6 +295,7 @@ where
         fs::remove_file(dest_path).await?;
     }
     fs::rename(&part_path, dest_path).await?;
+    let _ = fs::remove_file(&id_path).await; // докачка завершена — сайдкар не нужен
     Ok(())
 }
 
@@ -167,6 +314,9 @@ where
     F: FnMut(u64, u64) + Send + 'static,
 {
     let handle = tokio::runtime::Handle::current();
+    // Watcher создаем в async-контексте и переносим в blocking-замыкание:
+    // его задача живет на рантайме, а select! читает notify внутри block_on
+    let watcher = CancelWatcher::new(cancel.clone());
     tokio::task::spawn_blocking(move || {
         let total_bytes: u64 = entries.iter().map(|e| e.total_size).sum();
         let mut downloaded = 0u64;
@@ -178,36 +328,63 @@ where
         let result = (|| -> Result<(), SiaClientError> {
             for entry in &entries {
                 // rel_path из чужих метаданных — повторно санитизируем (zip-slip)
-                let name = sanitize_rel_path(&entry.rel_path)
-                    .ok_or_else(|| SiaClientError::Integrity(format!("небезопасный путь: {:?}", entry.rel_path)))?;
+                let name = sanitize_rel_path(&entry.rel_path).ok_or_else(|| {
+                    SiaClientError::Integrity(format!("небезопасный путь: {:?}", entry.rel_path))
+                })?;
                 // Stored: файлы уже сжаты/зашифрованы — не тратим CPU повторно
                 let options = SimpleFileOptions::default()
                     .compression_method(CompressionMethod::Stored)
                     .large_file(true)
                     .unix_permissions(0o644);
-                zip.start_file(name, options).map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                zip.start_file(name, options)
+                    .map_err(|e| SiaClientError::Zip(e.to_string()))?;
 
                 let mut entry_bytes = 0u64;
                 handle.block_on(async {
-                    for object_id in &entry.chunk_object_ids {
+                    for (idx, object_id) in entry.chunk_object_ids.iter().enumerate() {
                         let id = parse_object_id(object_id)?;
-                        let obj = shared.object(&id).await.map_err(|e| SiaClientError::Sdk(e.to_string()))?;
-                        let reader = shared.download(&obj, dl_opts(0)).map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+                        let obj = shared
+                            .object(&id)
+                            .await
+                            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
+                        let reader = shared
+                            .download(&obj, dl_opts(0))
+                            .map_err(|e| SiaClientError::Sdk(e.to_string()))?;
                         let mut reader = std::pin::pin!(reader);
                         let mut buf = vec![0u8; 256 * 1024];
+                        let mut hasher = blake3::Hasher::new();
                         loop {
                             if cancel.load(Ordering::Relaxed) {
                                 return Err(SiaClientError::Cancelled);
                             }
-                            let n = reader.read(&mut buf).await?;
+                            let n = tokio::select! {
+                                r = reader.read(&mut buf) => r?,
+                                _ = watcher.notify.notified() => {
+                                    return Err(SiaClientError::Cancelled);
+                                }
+                            };
                             if n == 0 {
                                 break;
                             }
-                            zip.write_all(&buf[..n]).map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                            zip.write_all(&buf[..n])
+                                .map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                            hasher.update(&buf[..n]);
                             entry_bytes += n as u64;
                             downloaded += n as u64;
                             if throttle.tick(false) {
                                 on_progress(downloaded, total_bytes);
+                            }
+                        }
+                        // blake3 чанка поверх Merkle-пруфов; legacy None → пропускаем
+                        if let Some(expected_hex) =
+                            entry.chunk_blake3.get(idx).and_then(|o| o.as_deref())
+                        {
+                            let actual = hasher.finalize().to_hex().to_string();
+                            if actual != expected_hex {
+                                return Err(SiaClientError::Integrity(format!(
+                                    "{}: чанк {idx} не сошёлся по blake3 в ZIP",
+                                    entry.rel_path
+                                )));
                             }
                         }
                     }
@@ -215,7 +392,8 @@ where
                 })?;
                 if entry_bytes != entry.total_size {
                     return Err(SiaClientError::Integrity(format!(
-                        "{}: в ZIP попало {entry_bytes} байт из {}", entry.rel_path, entry.total_size
+                        "{}: в ZIP попало {entry_bytes} байт из {}",
+                        entry.rel_path, entry.total_size
                     )));
                 }
             }
@@ -224,7 +402,8 @@ where
 
         match result {
             Ok(()) => {
-                zip.finish().map_err(|e| SiaClientError::Zip(e.to_string()))?;
+                zip.finish()
+                    .map_err(|e| SiaClientError::Zip(e.to_string()))?;
                 on_progress(downloaded, total_bytes);
                 Ok(())
             }
@@ -259,8 +438,58 @@ mod tests {
             total_chunks: 2,
             chunk_size: 256,
             chunk_object_ids: vec!["x".into(), "y".into()],
+            chunk_blake3: vec![None, None],
         };
         assert_eq!(expected_chunk_len(&e, 0), 256);
         assert_eq!(expected_chunk_len(&e, 1), 244);
+    }
+
+    fn entry_with(first_id: &str, total: u64) -> SharedFileEntry {
+        SharedFileEntry {
+            rel_path: "a.bin".into(),
+            total_size: total,
+            total_chunks: 1,
+            chunk_size: 256,
+            chunk_object_ids: vec![first_id.into()],
+            chunk_blake3: vec![None],
+        }
+    }
+
+    #[test]
+    fn test_resume_fingerprint_roundtrip() {
+        let e = entry_with("abc123", 500);
+        let fp = part_fingerprint(&e);
+        assert!(resume_is_trusted(Some(&fp), "abc123", 500));
+    }
+
+    #[test]
+    fn test_resume_untrusted_cases() {
+        // нет сайдкара (legacy .part) — не доверяем, начинаем заново
+        assert!(!resume_is_trusted(None, "abc", 500));
+        // чужой id первого чанка (другой файл с тем же именем)
+        assert!(!resume_is_trusted(Some("other\n500"), "abc", 500));
+        // другой размер
+        assert!(!resume_is_trusted(Some("abc\n999"), "abc", 500));
+        // битый формат
+        assert!(!resume_is_trusted(Some("abc"), "abc", 500));
+        assert!(!resume_is_trusted(Some("abc\nnotanumber"), "abc", 500));
+    }
+
+    #[tokio::test]
+    async fn test_hash_file_range_matches_blake3() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("data.bin");
+        fs::write(&p, b"hello world").await.unwrap();
+        // полный диапазон совпадает с эталонным blake3
+        let h = hash_file_range(&p, 0, 11).await.unwrap();
+        assert_eq!(h, blake3::hash(b"hello world").to_hex().to_string());
+        // offset + поддиапазон (имитация чанка не с начала файла)
+        let h2 = hash_file_range(&p, 6, 5).await.unwrap();
+        assert_eq!(h2, blake3::hash(b"world").to_hex().to_string());
+        // пустой чанк → blake3("")
+        let h0 = hash_file_range(&p, 0, 0).await.unwrap();
+        assert_eq!(h0, blake3::hash(b"").to_hex().to_string());
+        // файл короче запрошенного → ошибка целостности, не тихий успех
+        assert!(hash_file_range(&p, 0, 100).await.is_err());
     }
 }

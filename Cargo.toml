@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sia-core",
+    "crates/integration-tests",
     "apps/uploader-desktop/src-tauri",
     "apps/receiver-micro/src-tauri",
 ]
@@ -25,13 +26,40 @@ chrono = "0.4"
 hex = "0.4"
 walkdir = "2"
 tempfile = "3"
+# buffer_unordered для параллельных share/pin (лимит одновременных запросов).
+futures = "0.3"
+# Per-chunk хэш содержимого: сквозная проверка целостности поверх Merkle-пруфов SDK.
+blake3 = "1"
 # Системный keychain: AppKey нельзя хранить plaintext-файлом.
 keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
 
-# Оптимизация под размер: критично для переносимого receiver-micro.
+# Скорость в приоритете для uploader: горячий код (erasure coding, сеть) внутри
+# sia_storage и зависимостей, поэтому opt-level=3 на весь release-профиль.
 [profile.release]
 panic = "abort"
 codegen-units = 1
 lto = true
-opt-level = "z"
+opt-level = 3
 strip = true
+
+# Переносимый receiver-micro распространяется внутри каждой раздачи — ему
+# критичен размер, а не скорость: точечный override обратно на "z".
+[profile.release.package.receiver-micro]
+opt-level = "z"
+
+# Erasure coding и крипто SDK в debug непрофильно медленные: мок-тесты на
+# десятках МиБ занимали минуты. Оптимизируем только горячие зависимости
+# (sia_core здесь — крейт с crates.io, не наш sia-core); свой код остается
+# в debug ради отладки.
+[profile.dev.package.sia_storage]
+opt-level = 3
+[profile.dev.package.sia_reed_solomon]
+opt-level = 3
+[profile.dev.package.sia_core]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.blake2b_simd]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3

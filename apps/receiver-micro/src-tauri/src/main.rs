@@ -1,11 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-
-use commands::{
-    cancel_download, download_one, download_selected_zip, init_receiver, submit_key_payload,
-    unlock_with_password, ReceiverState,
-};
+use receiver_micro::commands::ReceiverState;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -23,12 +18,12 @@ fn main() {
             download_gate: Mutex::new(()),
         })
         .invoke_handler(tauri::generate_handler![
-            init_receiver,
-            unlock_with_password,
-            submit_key_payload,
-            cancel_download,
-            download_one,
-            download_selected_zip
+            receiver_micro::commands::init_receiver,
+            receiver_micro::commands::unlock_with_password,
+            receiver_micro::commands::submit_key_payload,
+            receiver_micro::commands::cancel_download,
+            receiver_micro::commands::download_one,
+            receiver_micro::commands::download_selected_zip
         ])
         .run(tauri::generate_context!())
         .expect("Ошибка запуска receiver-micro");
