@@ -1,17 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod commands;
-mod db;
-mod worker;
-
-use commands::{
-    check_saved_auth, cleanup_session, connect_sia, describe_selection, generate_share_zip,
-    get_session_progress, list_sessions, revoke_session, start_upload_session, validate_paths,
-    UploaderState,
-};
-use db::Database;
 use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
+use uploader_desktop::commands::UploaderState;
+use uploader_desktop::db::Database;
+use uploader_desktop::worker;
 
 /// Очередь живет в storage/ в корне проекта (видна и редактируема при разработке),
 /// корень ищется вверх от пути exe по маркерам workspace. У установленной сборки
@@ -57,16 +50,16 @@ fn main() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            check_saved_auth,
-            connect_sia,
-            describe_selection,
-            validate_paths,
-            start_upload_session,
-            generate_share_zip,
-            revoke_session,
-            cleanup_session,
-            get_session_progress,
-            list_sessions
+            uploader_desktop::commands::check_saved_auth,
+            uploader_desktop::commands::connect_sia,
+            uploader_desktop::commands::describe_selection,
+            uploader_desktop::commands::validate_paths,
+            uploader_desktop::commands::start_upload_session,
+            uploader_desktop::commands::generate_share_zip,
+            uploader_desktop::commands::revoke_session,
+            uploader_desktop::commands::cleanup_session,
+            uploader_desktop::commands::get_session_progress,
+            uploader_desktop::commands::list_sessions
         ])
         .run(tauri::generate_context!())
         .expect("Ошибка запуска uploader-desktop");

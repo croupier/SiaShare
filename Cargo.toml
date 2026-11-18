@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sia-core",
+    "crates/integration-tests",
     "apps/uploader-desktop/src-tauri",
     "apps/receiver-micro/src-tauri",
 ]
@@ -45,3 +46,20 @@ strip = true
 # критичен размер, а не скорость: точечный override обратно на "z".
 [profile.release.package.receiver-micro]
 opt-level = "z"
+
+# Erasure coding и крипто SDK в debug непрофильно медленные: мок-тесты на
+# десятках МиБ занимали минуты. Оптимизируем только горячие зависимости
+# (sia_core здесь — крейт с crates.io, не наш sia-core); свой код остается
+# в debug ради отладки.
+[profile.dev.package.sia_storage]
+opt-level = 3
+[profile.dev.package.sia_reed_solomon]
+opt-level = 3
+[profile.dev.package.sia_core]
+opt-level = 3
+[profile.dev.package.chacha20poly1305]
+opt-level = 3
+[profile.dev.package.blake2b_simd]
+opt-level = 3
+[profile.dev.package.blake3]
+opt-level = 3

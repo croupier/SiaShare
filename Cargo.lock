@@ -2390,6 +2390,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "integration-tests"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "hex",
+ "receiver-micro",
+ "sia-core",
+ "sia_storage",
+ "tauri",
+ "tauri-winres",
+ "tempfile",
+ "tokio",
+ "uploader-desktop",
+ "zip",
+]
+
+[[package]]
 name = "ipnet"
 version = "2.12.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

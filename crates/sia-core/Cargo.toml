@@ -20,3 +20,6 @@ blake3 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Встроенная мок-сеть SDK (индексатор + хосты в памяти): интеграционные тесты
+# гоняют настоящий Sdk/SharedSdk без единого сетевого запроса.
+sia_storage = { workspace = true, features = ["mock"] }

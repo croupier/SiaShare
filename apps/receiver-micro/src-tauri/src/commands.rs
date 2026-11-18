@@ -6,7 +6,7 @@ use sia_storage::SharedSdk; // read-only SDK получателя — НЕ Sdk
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Runtime, State};
 use tokio::sync::Mutex;
 
 pub struct ReceiverState {
@@ -109,10 +109,10 @@ pub async fn cancel_download(state: State<'_, ReceiverState>) -> Result<(), Stri
 }
 
 #[tauri::command]
-pub async fn download_one(
+pub async fn download_one<R: Runtime>(
     rel_path: String,
     save_to: String,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: State<'_, ReceiverState>,
 ) -> Result<(), String> {
     let _guard = state
@@ -150,10 +150,10 @@ pub async fn download_one(
 }
 
 #[tauri::command]
-pub async fn download_selected_zip(
+pub async fn download_selected_zip<R: Runtime>(
     rel_paths: Vec<String>,
     save_zip_to: String,
-    app: AppHandle,
+    app: AppHandle<R>,
     state: State<'_, ReceiverState>,
 ) -> Result<(), String> {
     let _guard = state

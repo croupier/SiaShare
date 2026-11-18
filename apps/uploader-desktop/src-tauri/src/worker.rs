@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Runtime};
 use tokio::sync::{watch, Semaphore};
 
 const MAX_CHUNK_ATTEMPTS: u32 = 8;
@@ -64,8 +64,9 @@ struct SessionProgress {
 /// Запускает пул воркеров + финализатор. Возвращает sender для подмены SDK:
 /// повторный вход просто шлет новый Arc<Sdk>, и все воркеры подхватывают его
 /// на следующей итерации (иначе они навсегда остались бы на старом аккаунте).
-pub fn start_upload_workers(
-    app: AppHandle,
+/// Обобщен по Runtime ради тестов с tauri::test::mock_app (MockRuntime).
+pub fn start_upload_workers<R: Runtime>(
+    app: AppHandle<R>,
     db: Database,
     concurrency: usize,
 ) -> watch::Sender<Option<Arc<Sdk>>> {
