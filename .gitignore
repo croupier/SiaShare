@@ -16,6 +16,9 @@ apps/uploader-desktop/src-tauri/resources/receiver-micro.exe
 # Сгенерированные Tauri схемы
 **/gen/schemas
 
+# Временные файлы Vite (остатки после жёсткого завершения dev-сервера)
+*.timestamp-*.mjs
+
 # Отсебятина
 .env
 /.srcBuilders
