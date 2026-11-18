@@ -5,8 +5,9 @@ mod db;
 mod worker;
 
 use commands::{
-    check_saved_auth, cleanup_session, connect_sia, generate_share_zip, get_session_progress,
-    list_sessions, revoke_session, start_upload_session, validate_paths, UploaderState,
+    check_saved_auth, cleanup_session, connect_sia, describe_selection, generate_share_zip,
+    get_session_progress, list_sessions, revoke_session, start_upload_session, validate_paths,
+    UploaderState,
 };
 use db::Database;
 use std::path::PathBuf;
@@ -58,6 +59,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             check_saved_auth,
             connect_sia,
+            describe_selection,
             validate_paths,
             start_upload_session,
             generate_share_zip,

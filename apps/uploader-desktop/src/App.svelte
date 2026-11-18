@@ -93,6 +93,16 @@
   let pathWarnings: PathWarning[] = [];
   let pendingPaths: string[] | null = null;
 
+  // --- Подтверждение загрузки после выбора файлов ---
+  let confirmSelection: { paths: string[]; count: number; bytes: number } | null = null;
+
+  function pluralFiles(n: number): string {
+    const m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return 'файл';
+    if (m10 >= 2 && m10 <= 4 && (m100 < 12 || m100 > 14)) return 'файла';
+    return 'файлов';
+  }
+
   $: inflightSum = [...inflight.values()].reduce((a, b) => a + b.fraction, 0);
   $: percent = totalChunks > 0
     ? Math.min(100, Math.round(((uploadedChunks + inflightSum) / totalChunks) * 100))
@@ -208,12 +218,24 @@
     const selected = await open({ directory: isDirectory, multiple: !isDirectory });
     if (!selected) return;
     const paths = Array.isArray(selected) ? selected : [selected];
+    // Считаем файлы и размер (папки — рекурсивно) и спрашиваем подтверждение
+    try {
+      const [count, bytes] = await invoke<[number, number]>('describe_selection', { paths });
+      if (count === 0) { alert('В выбранной папке нет файлов.'); return; }
+      confirmSelection = { paths, count, bytes };
+    } catch (e) { alert(`Ошибка чтения выбранных путей: ${e}`); }
+  }
+
+  async function confirmUpload() {
+    const selection = confirmSelection;
+    confirmSelection = null;
+    if (!selection) return;
     // Preflight: предупреждаем о несовместимых с Windows именах до загрузки
     try {
-      const warnings = await invoke<PathWarning[]>('validate_paths', { paths });
-      if (warnings.length) { pendingPaths = paths; pathWarnings = warnings; return; }
+      const warnings = await invoke<PathWarning[]>('validate_paths', { paths: selection.paths });
+      if (warnings.length) { pendingPaths = selection.paths; pathWarnings = warnings; return; }
     } catch (e) { alert(`Ошибка проверки путей: ${e}`); return; }
-    await startUpload(paths);
+    await startUpload(selection.paths);
   }
 
   async function startUpload(paths: string[]) {
@@ -405,6 +427,22 @@
         {/if}
       </div>
     {/if}
+  {/if}
+
+  {#if confirmSelection}
+    <div class="fixed inset-0 z-50 grid place-items-center bg-black/60 p-6">
+      <div class="card w-full max-w-md">
+        <h3 class="mb-2 text-lg font-semibold">Загрузить?</h3>
+        <p class="mb-5 text-sm text-slate-300">
+          {confirmSelection.count} {pluralFiles(confirmSelection.count)} размером
+          <strong class="text-white">{formatBytes(confirmSelection.bytes)}</strong>
+        </p>
+        <div class="flex gap-3">
+          <button class="btn-primary" on:click={confirmUpload}>Да</button>
+          <button class="btn-secondary" on:click={() => (confirmSelection = null)}>Нет</button>
+        </div>
+      </div>
+    </div>
   {/if}
 
   {#if pathWarnings.length}

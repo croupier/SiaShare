@@ -217,6 +217,17 @@ pub fn collect_files_recursive(
     Ok(result)
 }
 
+/// Подтверждение перед загрузкой: сколько файлов и их суммарный размер
+/// в выбранном наборе путей (папки обходятся рекурсивно, как при загрузке).
+#[tauri::command]
+pub async fn describe_selection(paths: Vec<String>) -> Result<(u64, u64), String> {
+    let collected = tokio::task::spawn_blocking(move || collect_files_recursive(&paths))
+        .await
+        .map_err(|e| e.to_string())??;
+    let total_bytes: u64 = collected.iter().map(|(_, _, s)| *s).sum();
+    Ok((collected.len() as u64, total_bytes))
+}
+
 /// Preflight: проверка путей на совместимость с Windows ДО постановки в очередь.
 /// UI показывает список предупреждений и даёт выбор: игнор (грузим как есть)
 /// или отмена (пользователь исправляет имена сам). Получателя не трогаем.
